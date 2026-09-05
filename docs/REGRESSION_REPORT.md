@@ -2,6 +2,32 @@
 
 ---
 
+## v1.2.0 类别·项目·任务与计时升级回归（2026-09-06，分支 feature/v1.2-tasks-projects）
+
+依据 `docs/plans/V1.2_TASKS_PROJECTS_PLAN.md` 执行阶段 A–H（G2/G3 排版与字体按用户指示挂起）。
+
+### 修复与测试映射
+| 阶段 | 交付 | 关键测试 |
+|---|---|---|
+| A Schema v4 | profiles/categories/projects/budget_history/focus_segments + 任务新列 + timer.rs 删除 | v3→v4 迁移集成测试（项目归并/预算推算/片段回填） |
+| B 片段账本 | start/pause/resume/reset/complete/finish 全路径接片段；switch v2 同钟切分；complete_task_now 原子命令 | switch_splits_effective_time_between_tasks、complete_task_now_saves_segment_and_unbinds_clock 等 |
+| C 领域 CRUD | 类别/项目/任务扩展校验（同档案、唯一名、项目完成规则） | category_and_project_crud_respect_uniqueness_and_completion_rules |
+| D 统计 | byProject 按片段发生时归属 + byCategory（快照聚合） | get_statistics 用例 + 存量统计全绿 |
+| E/F/G1 前端 | 契约扩展、快速创建/详情/搜索筛选/项目面板、选择器实时进度与达预计徽标 | 冒烟（归档语义）、一致性、创建反馈 45 用例全绿 |
+| H 版本 | 1.2.0 + CHANGELOG/REGRESSION_REPORT/README | — |
+
+### 门禁结果
+- `cargo test`：**109 passed**（基线 103 → +6）、0 failed
+- `pnpm verify`：**vitest 45 passed**、tsc 0 错误
+- `pnpm tauri build --no-bundle`：✓ release EXE 构建成功
+
+### 待办（用户醒来后）
+- G2/G3 排版与字体（用户明确要求亲自拍板）
+- 迁移预览 UI（A5，一次性弹窗——已实现迁移逻辑，UI 呈现方式待确认）
+- v1.1.1 真实库副本升级演练 + 实机矩阵 + 发版
+
+---
+
 ## v1.1.2 一致性修复回归（2026-09-06，分支 feature/v1.1.2-consistency）
 
 依据 `docs/plans/V1.1.2_CONSISTENCY_PLAN.md` 执行，阶段 A–F 完成（夜间自主执行，实机 EXE 矩阵待维护者确认）。
