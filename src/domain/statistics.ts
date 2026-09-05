@@ -22,7 +22,13 @@ function isoDate(date: Date): string {
 /** Local-midnight boundary for the given day. */
 export function dayBoundary(date: Date): StatisticsDayBoundary {
   const from = startOfDay(date)
-  return { date: isoDate(date), from, to: from + 86_400_000 }
+  // v1.1.2 D2: the end is the NEXT calendar midnight, not `from + 86_400_000`
+  // — on DST days a fixed offset slides the boundary by an hour (23h days
+  // would end at 01:00 the next day, 25h days at 23:00 the same day).
+  const nextDay = new Date(date)
+  nextDay.setHours(0, 0, 0, 0)
+  nextDay.setDate(nextDay.getDate() + 1)
+  return { date: isoDate(date), from, to: nextDay.getTime() }
 }
 
 /**

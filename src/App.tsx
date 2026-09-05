@@ -7,7 +7,7 @@ import { useAppGateway } from "./services/gatewayContext";
 
 import { C, CARD, SIDEBAR_GLASS } from "./features/shared/palette";
 import type { NavSection, SessionLog } from "./features/shared/types";
-import { MODE_LABELS, sessionToLog, sortLogsDesc, upsertLogNewestFirst, isCountedFocus } from "./features/shared/format";
+import { MODE_LABELS, sessionToLog, sortLogsDesc, upsertLogNewestFirst, formatFocusedDuration, isCountedFocus } from "./features/shared/format";
 import { playCompletionSound, notifyCompletion } from "./features/shared/notify";
 import { GoalRing } from "./features/timer/GoalRing";
 import { TimerPanel } from "./features/timer/TimerPanel";
@@ -400,7 +400,7 @@ export default function App() {
           setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
           refreshStats();
           if (result.statisticsEligible) {
-            setToast(`已记录 ${Math.max(1, Math.round(result.session.focusedSeconds / 60))} 分钟专注`);
+            setToast(`已记录 ${formatFocusedDuration(result.session.focusedSeconds)} 专注`);
           } else {
             setToast("本次不足 30 秒，未计入统计");
           }

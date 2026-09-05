@@ -10,6 +10,16 @@ export function pad(n: number) { return String(n).padStart(2, "0"); }
 export function formatSeconds(s: number) { return { m: pad(Math.floor(s/60)), s: pad(s%60) }; }
 export function uid() { return Math.random().toString(36).slice(2,9); }
 
+/**
+ * v1.1.2 D3: "已记录 30 秒" must never render as "已记录 1 分钟" — sub-minute
+ * durations spell out their seconds; everything else rounds up to minutes.
+ */
+export function formatFocusedDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} 秒`;
+  return `${Math.round(s / 60)} 分钟`;
+}
+
 /** Projects a persisted session onto the activity-list row shape. */
 export function sessionToLog(session: TimerSession): SessionLog {
   const at = new Date(session.startedAt);

@@ -1682,11 +1682,14 @@ pub fn get_statistics(
 
     // Collect completed focus sessions in range. Only statistics-eligible
     // sessions count (v1.1: 30-second rule + abandoned never counted).
+    // v1.1.2 D1: the total range is half-open [from, to) — the same rule the
+    // per-day buckets follow, so a session exactly at `to` can never make the
+    // total disagree with the bucket sum.
     let mut stmt = conn.prepare(
         &format!(
             "SELECT {SESSION_COLUMNS} FROM sessions
              WHERE mode = 'focus' AND status = 'completed' AND statistics_eligible = 1
-               AND started_at >= ?1 AND started_at <= ?2
+               AND started_at >= ?1 AND started_at < ?2
              ORDER BY started_at ASC"
         ),
     )?;
@@ -2460,6 +2463,51 @@ mod tests {
         assert!(result.closed_session.is_none());
         assert_eq!(result.timer.revision, started.revision);
         assert_eq!(result.timer.state, TimerState::Running);
+    }
+
+    // ─── v1.1.2 stage D: half-open [from, to) statistics range ──────────────
+
+    /// Seeds an eligible focus session with explicit timestamps (the generic
+    /// `seed_session` helper pins started_at=1).
+    fn seed_session_at(conn: &Connection, id: &str, started_at: i64, focused_seconds: i64) {
+        let (fallback_id, fallback_name) = fallback_tag(conn).expect("fallback tag");
+        conn.execute(
+            "INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                                   tag_name_snapshot, mode, status, planned_seconds,
+                                   focused_seconds, started_at, ended_at, finish_reason,
+                                   statistics_eligible, qualification_reason)
+             VALUES (?1, NULL, '快照', '通用', ?2, ?3, 'focus', 'completed', 1500, ?4, ?5, ?6,
+                     'elapsed', 1, 'qualified')",
+            params![id, fallback_id, fallback_name, focused_seconds, started_at, started_at + focused_seconds * 1000],
+        )
+        .expect("session should insert");
+    }
+
+    #[test]
+    fn statistics_treat_the_range_as_half_open() {
+        let conn = db::open_in_memory().expect("database should open");
+        let from = 1_000i64;
+        let to = 2_000i64;
+        // Inside the range — counted.
+        seed_session_at(&conn, "in-range", from + 100, 60);
+        // Exactly AT `to` — must be excluded from BOTH the total and the
+        // daily bucket (v1.1.2 D1: the two aggregates share one rule).
+        seed_session_at(&conn, "at-to", to, 60);
+
+        let stats = get_statistics(
+            &conn,
+            &StatisticsQuery {
+                from,
+                to,
+                days: vec![StatisticsDayBoundary { date: "d".to_owned(), from, to }],
+            },
+        )
+        .expect("statistics");
+
+        assert_eq!(stats.focus_session_count, 1, "session at `to` must not count");
+        assert_eq!(stats.focus_seconds, 60);
+        assert_eq!(stats.by_day[0].sessions, 1, "total and buckets must agree");
+        assert_eq!(stats.by_day[0].focus_seconds, 60);
     }
 
     fn seed_session(
