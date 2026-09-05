@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { CreateTaskInput, Tag, TagDeletePreview, Task, TaskPriority } from "../../domain/models";
 import { C, CARD } from "../shared/palette";
 import { HorizonDivider } from "../timer/GoalRing";
@@ -11,13 +11,15 @@ function PriorityPip({ p }: { p: TaskPriority }) {
   return <span style={{ width: 5, height: 5, borderRadius: "50%", background: colors[p], display: "inline-block", flexShrink: 0 }} />;
 }
 
-export function TasksPanel({ tasks, tags, onCreateTask, onToggleTask, onDeleteTask, onCyclePriority, tagOps }: {
+export function TasksPanel({ tasks, tags, onCreateTask, onToggleTask, onDeleteTask, onCyclePriority, onNotify, tagOps }: {
   tasks: Task[];
   tags: Tag[];
   onCreateTask: (input: CreateTaskInput) => Promise<unknown>;
   onToggleTask: (id: string) => Promise<unknown>;
   onDeleteTask: (id: string) => Promise<unknown>;
   onCyclePriority: (id: string) => Promise<unknown>;
+  /** v1.1.2 A1: create failures surface here; the draft is kept for retry. */
+  onNotify?: (message: string) => void;
   tagOps: {
     createTag: (name: string) => Promise<unknown>;
     renameTag: (id: string, name: string) => Promise<unknown>;
@@ -35,20 +37,33 @@ export function TasksPanel({ tasks, tags, onCreateTask, onToggleTask, onDeleteTa
   const [statusFilter, setStatusFilter] = useState<"all"|"active"|"done">("all");
   const [tagFilter, setTagFilter]     = useState<string>("all");
   const [managerOpen, setManagerOpen] = useState(false);
+  // v1.1.2 A1: serial saves — a second submit is ignored until the current
+  // create settles, and the title clears only on success.
+  const [submitting, setSubmitting] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const fallbackId = tags.find(t => t.isFallback)?.id ?? "system-other";
   const effectiveTagId = formTagId || fallbackId;
 
-  const addTask = () => {
+  const addTask = async () => {
+    if (submitting) return;
     const title = newTitle.trim(); if (!title) return;
-    onCreateTask({
-      title,
-      tagId: effectiveTagId,
-      project: formProject.trim() || "通用",
-      priority: formPriority,
-      pomodoroTarget: Math.max(1, Math.min(99, formPomodoro || 1)),
-    });
-    setNewTitle("");
+    setSubmitting(true);
+    try {
+      await onCreateTask({
+        title,
+        tagId: effectiveTagId,
+        project: formProject.trim() || "通用",
+        priority: formPriority,
+        pomodoroTarget: Math.max(1, Math.min(99, formPomodoro || 1)),
+      });
+      setNewTitle("");
+    } catch (err) {
+      onNotify?.(`任务创建失败，草稿已保留：${err instanceof Error ? err.message : String(err)}`);
+      inputRef.current?.focus();
+    } finally {
+      setSubmitting(false);
+    }
   };
   const toggleTask    = (id: string) => { void onToggleTask(id); };
   const deleteTask    = (id: string) => { void onDeleteTask(id); };
@@ -123,12 +138,18 @@ export function TasksPanel({ tasks, tags, onCreateTask, onToggleTask, onDeleteTa
       <div style={{ flexShrink: 0 }}>
         <div style={{ display: "flex", gap: 7, padding: "9px 22px 5px" }}>
           <input
+            ref={inputRef}
             value={newTitle} onChange={e => setNewTitle(e.target.value)}
-            onKeyDown={e => e.key==="Enter" && addTask()}
+            onKeyDown={e => {
+              // v1.1.2 A2: an Enter that confirms IME candidates must never
+              // submit — the composition event reports isComposing (and
+              // legacy keyCode 229).
+              if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) void addTask();
+            }}
             placeholder="添加任务…" aria-label="任务标题" className="input-ocean"
             style={{ flex: 1, ...CARD, borderRadius: 10, padding: "8px 12px", fontSize: 12, color: C.textPrimary, fontFamily: "var(--font-sans)" }}
           />
-          <button onClick={addTask} className="btn-add" aria-label="添加任务"
+          <button onClick={() => void addTask()} disabled={submitting} aria-busy={submitting} className="btn-add" aria-label="添加任务"
             style={{
               width: 34, height: 34, borderRadius: 9, flexShrink: 0,
               background: "rgba(27,37,44,0.36)",

@@ -518,6 +518,7 @@ export default function App() {
           onToggleTask={toggleTask}
           onDeleteTask={deleteTask}
           onCyclePriority={cyclePriority}
+          onNotify={setToast}
           tagOps={{
             createTag: createTagOp,
             renameTag: renameTagOp,
