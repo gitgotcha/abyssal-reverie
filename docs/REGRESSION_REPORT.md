@@ -2,6 +2,30 @@
 
 ---
 
+## v1.1.2 一致性修复回归（2026-09-06，分支 feature/v1.1.2-consistency）
+
+依据 `docs/plans/V1.1.2_CONSISTENCY_PLAN.md` 执行，阶段 A–F 完成（夜间自主执行，实机 EXE 矩阵待维护者确认）。
+
+### 修复与测试映射
+| 阶段 | 修复 | 关键测试 |
+|---|---|---|
+| A 创建反馈 | 串行保存、成功才清空、失败保草稿、IME 守卫 | TasksPanel.create.test（4 用例：成功清空/失败保留+回焦/防连点/组合态 Enter） |
+| B 选中一致 | 高亮跟随后台快照；`switch_timer_task` 单事务（保存旧会话 + 开新一轮） | Rust 6 用例（成功/回滚/暂停切换/stale revision/幂等重放/同任务 no-op）+ 前端 2 用例 |
+| C 日志一致 | 最新在前规范序 `(startedAt, id)`；头部插入按 ID 去重；休息/不足 30 秒不入活动栏；统计串行刷新 | consistency.test（双入口单条记录/重载顺序一致）+ format.test |
+| D 统计口径 | 总量 `[from,to)`；日历法次日零点（DST 23/25h） | Rust 半开区间边界用例 + statistics.test DST 4 用例 |
+| E 版本守卫 | `user_version > 3` 拒开（Phase 0 只读探针，探针失败回落损坏处理）；原生消息框退出 | Rust `newer_database_is_refused_and_untouched`（字节级不变 + 无 sidecar） |
+
+### 门禁结果
+- `cargo test`：**103 passed**（基线 95 → +8）、0 failed、1 ignored（真实库演练）
+- `pnpm verify`（tsc + vitest + vite build）：**vitest 45 passed**（基线 29 → +16）、tsc 0 错误
+- `pnpm tauri build --no-bundle`：✓（dev profile 构建通过）
+- **未执行**：NSIS/便携发布构建、实机矩阵（干净 Windows/断网/旧库升级/DPI）——待维护者确认后按 ACCEPTANCE_GUIDE 执行
+
+### 已知行为变化
+- 运行中点击其他任务：确认后「保存当前 + 开新一轮」（主钟重置为完整时长）；同钟不重置的片段切分在 v1.2 落地。
+
+---
+
 ## v1.1.0 本地体验前置改造回归（2026-09-05，分支 feature-v1.1-local-prerequisites）
 
 依据规格「本地体验前置改造设计」与两轮评审（6 阻断 + 10 建议）执行，阶段 A–G 全部完成。
