@@ -95,6 +95,24 @@ export class TauriAppGateway implements AppGateway {
     return () => { stopped = true; unlisten?.() }
   }
 
+  subscribeTimerSettled(cb: (payload: { timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }) => void): () => void {
+    let unlisten: UnlistenFn | undefined
+    let stopped = false
+    void listen<{ timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }>('timer-settled', e => cb(e.payload))
+      .then(fn => { unlisten = stopped ? void fn() : fn })
+      .catch(() => undefined)
+    return () => { stopped = true; unlisten?.() }
+  }
+
+  subscribeTimerChanged(cb: (snapshot: TimerSnapshot) => void): () => void {
+    let unlisten: UnlistenFn | undefined
+    let stopped = false
+    void listen<TimerSnapshot>('timer-changed', e => cb(e.payload))
+      .then(fn => { unlisten = stopped ? void fn() : fn })
+      .catch(() => undefined)
+    return () => { stopped = true; unlisten?.() }
+  }
+
   subscribeTrayAction(cb: (action: TrayAction) => void): () => void {
     let unlisten: UnlistenFn | undefined
     let stopped = false

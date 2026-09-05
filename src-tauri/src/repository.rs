@@ -1364,6 +1364,37 @@ pub fn get_task_progress(conn: &Connection, task_id: &str) -> Result<TaskProgres
 /// v1.2 B4: complete the current task NOW — close the open segment, confirm
 /// the ledger once the session qualifies, mark the task done, unbind it and
 /// keep the main clock PAUSED with its remaining time. Atomic + idempotent.
+/// v1.3 A1: the authoritative settlement path, driven by the background
+/// ticker so an unresponsive/hidden frontend can never delay settlement.
+/// Reuses `complete_timer` (idempotent): whichever entry settles first wins,
+/// the other returns the existing session with `newly_completed = false`.
+/// Returns `None` when nothing is due.
+pub fn settle_expired_timer(conn: &mut Connection) -> Result<Option<CompleteTimerResult>, CommandError> {
+    let timer = get_timer(conn)?;
+    if timer.state != TimerState::Running {
+        return Ok(None);
+    }
+    let session_id = match &timer.active_session_id {
+        Some(id) => id.clone(),
+        None => return Ok(None),
+    };
+    match timer.target_end_at {
+        Some(end) if end <= now_millis() => {}
+        _ => return Ok(None),
+    }
+    let settings = get_settings(conn)?;
+    let result = complete_timer(
+        conn,
+        &settings,
+        &CompleteTimerInput {
+            expected_revision: timer.revision,
+            active_session_id: session_id,
+            recovery: None,
+        },
+    )?;
+    Ok(Some(result))
+}
+
 pub fn complete_task_now(
     conn: &mut Connection,
     input: &CompleteTaskInput,
@@ -3316,6 +3347,44 @@ mod tests {
              WHERE task_id = ?1 AND source = 'recalc'",
             params![task.id], |row| Ok((row.get(0)?, row.get(1)?))).expect("history");
         assert_eq!(rows, (old_target, old_target + 1200));
+    }
+
+    #[test]
+    fn ticker_settles_expired_without_frontend_and_is_single_shot() {
+        let mut conn = db::open_in_memory().expect("db");
+        let settings = get_settings(&conn).expect("settings");
+        let task = insert_task(&conn, &create_input("后台结算")).expect("task");
+        let started = start_focus(&mut conn, &settings, Some(&task.id));
+        let session_id = started.active_session_id.clone().expect("session");
+
+        // Not due yet -> None.
+        let none = settle_expired_timer(&mut conn).expect("settle probe");
+        assert!(none.is_none());
+
+        // Expire the round by moving the deadline into the past.
+        let now = now_millis();
+        conn.execute(
+            "UPDATE timer_state SET started_at = ?1, target_end_at = ?2 WHERE id = 1",
+            params![now - started.duration_seconds * 1000, now - 1_000],
+        )
+        .expect("expire clock");
+
+        // First settle writes the session and flips the timer to done.
+        let settled = settle_expired_timer(&mut conn)
+            .expect("settle")
+            .expect("a due session must settle");
+        assert!(settled.newly_completed);
+        assert_eq!(settled.timer.state, TimerState::Done);
+        assert_eq!(settled.session.id, session_id);
+        assert_eq!(settled.session.focused_seconds, started.duration_seconds);
+
+        // Second call: nothing due - exactly one settlement.
+        let again = settle_expired_timer(&mut conn).expect("settle again");
+        assert!(again.is_none());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions WHERE id = ?1", params![session_id], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
     }
 
     #[test]

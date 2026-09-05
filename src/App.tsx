@@ -485,6 +485,29 @@ export default function App() {
     return gateway.subscribeTimerExpired(() => handleExpire());
   }, [gateway, handleExpire]);
 
+  // v1.3 A1: the authoritative backend settlement — refresh from its result
+  // (sound/notify/auto-break fire once, guarded by newlyCompleted).
+  useEffect(() => {
+    return gateway.subscribeTimerSettled(payload => {
+      applyTimer(payload.timer);
+      if (payload.newlyCompleted) {
+        setLogs(p => upsertLogNewestFirst(p, sessionToLog(payload.session)));
+        refreshStats();
+        const s = settingsRef.current;
+        if (s?.soundEnabled) playCompletionSound();
+        if (s?.notificationEnabled) notifyCompletion(payload.session.taskTitleSnapshot);
+        if (s?.autoStartBreak && payload.session.mode === "focus") {
+          void runStart(payload.timer, "short", null).catch(resync);
+        }
+      }
+    });
+  }, [gateway, applyTimer, refreshStats, resync, runStart]);
+
+  // v1.3 A4: any window's timer change lands here (multi-window readiness).
+  useEffect(() => {
+    return gateway.subscribeTimerChanged(snapshot => applyTimer(snapshot));
+  }, [gateway, applyTimer]);
+
   // Tray menu actions route through the existing handlers so the optimistic-
   // concurrency revision flow stays single-sourced.
   useEffect(() => {

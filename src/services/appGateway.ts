@@ -82,6 +82,10 @@ export interface AppGateway {
   setTrayIndicator(input: TrayIndicator): Promise<void>
   /** Subscribes to the Rust completion backstop. Returns an unsubscribe. */
   subscribeTimerExpired(cb: (payload: TimerExpiredPayload) => void): () => void
+  /** v1.3 A1: authoritative settlement result from the background ticker. */
+  subscribeTimerSettled(cb: (payload: { timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }) => void): () => void
+  /** v1.3 A4: snapshot broadcast to every window after a timer change. */
+  subscribeTimerChanged(cb: (snapshot: TimerSnapshot) => void): () => void
   /** Subscribes to tray menu actions (pause/resume, reset). Returns an unsubscribe. */
   subscribeTrayAction(cb: (action: TrayAction) => void): () => void
   /** Subscribes to the global-shortcut conflict warning (hotkey taken by another

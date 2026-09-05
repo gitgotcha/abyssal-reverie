@@ -223,9 +223,26 @@ fn ticker(app: tauri::AppHandle) {
         if let Some(timer) = expired {
             let id = timer.active_session_id.clone().unwrap();
             if last_emitted.as_deref() != Some(id.as_str()) {
-                last_emitted = Some(id.clone());
-                // Payload carries the id + revision so the frontend's
-                // `handleExpire` path can call `complete_timer` directly.
+                // v1.3 A1: settle in Rust FIRST (authoritative, durable), then
+                // notify every window with the result. The legacy
+                // `timer-expired` event is still emitted as a fallback — the
+                // frontend's `complete_timer` is idempotent, so exactly one
+                // session is ever written.
+                let settled = app.try_state::<AppState>().and_then(|state| {
+                    let mut conn = state.db.lock().ok()?;
+                    repository::settle_expired_timer(&mut conn).ok()
+                });
+                match settled {
+                    // Settled in Rust: latch and broadcast the result.
+                    Some(Some(result)) => {
+                        last_emitted = Some(id.clone());
+                        let _ = app.emit("timer-settled", &result);
+                    }
+                    // Nothing due (frontend settled first) or a transient lock
+                    // failure: no latch, the next tick re-evaluates safely
+                    // (settlement is idempotent).
+                    _ => {}
+                }
                 let _ = app.emit(
                     "timer-expired",
                     serde_json::json!({

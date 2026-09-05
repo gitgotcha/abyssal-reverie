@@ -2,6 +2,7 @@ use std::fs;
 use std::sync::MutexGuard;
 
 use rusqlite::Connection;
+use tauri::Emitter;
 use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -157,9 +158,11 @@ pub fn get_all_task_progress(state: State<'_, AppState>) -> Result<Vec<crate::mo
 }
 
 #[tauri::command]
-pub fn complete_task_now(state: State<'_, AppState>, input: crate::models::CompleteTaskInput) -> Result<crate::models::CompleteTaskResult, CommandError> {
+pub fn complete_task_now(app: tauri::AppHandle, state: State<'_, AppState>, input: crate::models::CompleteTaskInput) -> Result<crate::models::CompleteTaskResult, CommandError> {
     let mut conn = lock_db(&state)?;
-    repository::complete_task_now(&mut conn, &input)
+    let result = repository::complete_task_now(&mut conn, &input)?;
+    let _ = app.emit("timer-changed", &result.timer);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -171,36 +174,46 @@ pub fn save_settings(state: State<'_, AppState>, input: AppSettings) -> Result<S
 // ─── Timer state machine ─────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn start_timer(state: State<'_, AppState>, input: StartTimerInput) -> Result<TimerSnapshot, CommandError> {
+pub fn start_timer(app: tauri::AppHandle, state: State<'_, AppState>, input: StartTimerInput) -> Result<TimerSnapshot, CommandError> {
     let mut conn = lock_db(&state)?;
     let settings = repository::get_settings(&conn)?;
-    repository::start_timer(&mut conn, &settings, &input)
+    let snapshot = repository::start_timer(&mut conn, &settings, &input)?;
+    let _ = app.emit("timer-changed", &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
-pub fn pause_timer(state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
+pub fn pause_timer(app: tauri::AppHandle, state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
     let mut conn = lock_db(&state)?;
-    repository::pause_timer(&mut conn, &input)
+    let snapshot = repository::pause_timer(&mut conn, &input)?;
+    let _ = app.emit("timer-changed", &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
-pub fn resume_timer(state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
+pub fn resume_timer(app: tauri::AppHandle, state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
     let mut conn = lock_db(&state)?;
-    repository::resume_timer(&mut conn, &input)
+    let snapshot = repository::resume_timer(&mut conn, &input)?;
+    let _ = app.emit("timer-changed", &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
-pub fn reset_timer(state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
+pub fn reset_timer(app: tauri::AppHandle, state: State<'_, AppState>, input: TimerRevisionInput) -> Result<TimerSnapshot, CommandError> {
     let mut conn = lock_db(&state)?;
     let settings = repository::get_settings(&conn)?;
-    repository::reset_timer(&mut conn, &settings, &input)
+    let snapshot = repository::reset_timer(&mut conn, &settings, &input)?;
+    let _ = app.emit("timer-changed", &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
-pub fn switch_timer_mode(state: State<'_, AppState>, input: SwitchTimerModeInput) -> Result<TimerSnapshot, CommandError> {
+pub fn switch_timer_mode(app: tauri::AppHandle, state: State<'_, AppState>, input: SwitchTimerModeInput) -> Result<TimerSnapshot, CommandError> {
     let mut conn = lock_db(&state)?;
     let settings = repository::get_settings(&conn)?;
-    repository::switch_timer_mode(&mut conn, &settings, &input)
+    let snapshot = repository::switch_timer_mode(&mut conn, &settings, &input)?;
+    let _ = app.emit("timer-changed", &snapshot);
+    Ok(snapshot)
 }
 
 /// v1.1.2: switch the active round's task — closes the current session with
@@ -208,30 +221,38 @@ pub fn switch_timer_mode(state: State<'_, AppState>, input: SwitchTimerModeInput
 /// atomically.
 #[tauri::command]
 pub fn switch_timer_task(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: crate::models::SwitchTimerTaskInput,
 ) -> Result<crate::models::SwitchTimerTaskResult, CommandError> {
     let mut conn = lock_db(&state)?;
     let settings = repository::get_settings(&conn)?;
-    repository::switch_timer_task(&mut conn, &settings, &input)
+    let result = repository::switch_timer_task(&mut conn, &settings, &input)?;
+    let _ = app.emit("timer-changed", &result.timer);
+    Ok(result)
 }
 
 #[tauri::command]
-pub fn complete_timer(state: State<'_, AppState>, input: CompleteTimerInput) -> Result<CompleteTimerResult, CommandError> {
+pub fn complete_timer(app: tauri::AppHandle, state: State<'_, AppState>, input: CompleteTimerInput) -> Result<CompleteTimerResult, CommandError> {
     let mut conn = lock_db(&state)?;
     let settings = repository::get_settings(&conn)?;
-    repository::complete_timer(&mut conn, &settings, &input)
+    let result = repository::complete_timer(&mut conn, &settings, &input)?;
+    let _ = app.emit("timer-changed", &result.timer);
+    Ok(result)
 }
 
 // ─── Sessions and statistics ─────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn finish_timer(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: FinishTimerInput,
 ) -> Result<FinishTimerResult, CommandError> {
     let mut conn = lock_db(&state)?;
-    repository::finish_timer(&mut conn, &input)
+    let result = repository::finish_timer(&mut conn, &input)?;
+    let _ = app.emit("timer-changed", &result.timer);
+    Ok(result)
 }
 
 #[tauri::command]

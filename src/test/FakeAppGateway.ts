@@ -83,6 +83,8 @@ export class FakeAppGateway implements AppGateway {
   private projects: Project[] = []
   private failures: InjectedError[] = []
   private timerExpiredHandler: ((payload: TimerExpiredPayload) => void) | null = null
+  private settledHandler: ((payload: { timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }) => void) | null = null
+  private changedHandler: ((snapshot: TimerSnapshot) => void) | null = null
 
   /** Queue an error that the next gateway call will reject with. */
   injectFailure(code: string, message = 'injected failure'): void {
@@ -783,9 +785,31 @@ export class FakeAppGateway implements AppGateway {
     return () => { this.timerExpiredHandler = null }
   }
 
+  subscribeTimerSettled(cb: (payload: { timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }) => void): () => void {
+    this.settledHandler = cb
+    return () => { this.settledHandler = null }
+  }
+
+  subscribeTimerChanged(cb: (snapshot: TimerSnapshot) => void): () => void {
+    this.changedHandler = cb
+    return () => { this.changedHandler = null }
+  }
+
   /** Test hook: fire the background `timer-expired` event like Rust's ticker. */
   emitTimerExpired(): void {
     this.timerExpiredHandler?.({ activeSessionId: this.timer.activeSessionId ?? '', expectedRevision: this.timer.revision })
+  }
+
+  /** Test hook: fire the v1.3 authoritative settlement event. */
+  emitTimerSettled(sessionId: string): void {
+    const session = this.sessions.find(s => s.id === sessionId)
+    if (!session) return
+    this.settledHandler?.({ timer: this.timer, session, newlyCompleted: true })
+  }
+
+  /** Test hook: fire the v1.3 snapshot broadcast. */
+  emitTimerChanged(): void {
+    this.changedHandler?.(this.timer)
   }
 
   /** Test hook: drop a persisted session directly into the (fake) database. */
