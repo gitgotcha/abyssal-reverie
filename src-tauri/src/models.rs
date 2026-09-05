@@ -11,6 +11,12 @@ pub enum TaskPriority {
     Low,
 }
 
+impl Default for TaskPriority {
+    fn default() -> Self {
+        TaskPriority::Med
+    }
+}
+
 impl TaskPriority {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -207,7 +213,28 @@ pub struct Task {
     pub done: bool,
     pub pomodoro_target: i64,
     pub priority: TaskPriority,
+    /// Resolved display name of the owning project (or `通用` when the task
+    /// is standalone). Kept in sync with `project_id`; used for session
+    /// snapshots and preserved in v2 backups for compatibility.
     pub project: String,
+    /// v1.2: owning project row (NULL = standalone task).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// v1.2: frozen budget `预计番茄数 × 创建时单次专注分钟 × 60`.
+    #[serde(default)]
+    pub target_seconds: i64,
+    /// v1.2: how the budget was set (creation/migration/recalc).
+    #[serde(default)]
+    pub budget_source: String,
+    /// v1.2: todo | done | archived (kept in sync with `done`).
+    #[serde(default = "default_task_status")]
+    pub status: String,
+    /// v1.2: user-facing deadline (ISO date string).
+    #[serde(default)]
+    pub deadline: Option<String>,
+    /// v1.2: free notes.
+    #[serde(default)]
+    pub notes: String,
     /// Owning primary tag. Defaults to the fallback tag for data written
     /// before v1.1 (old backup JSON lacks the field).
     #[serde(default = "default_task_tag_id")]
@@ -216,6 +243,10 @@ pub struct Task {
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
+}
+
+fn default_task_status() -> String {
+    "todo".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,31 +415,182 @@ pub struct Statistics {
     /// v1.1: tag distribution, aggregated by tag_name_snapshot (renaming a
     /// tag must not rewrite historical statistics).
     pub by_tag: Vec<ProjectStat>,
+    /// v1.2: category distribution by the segments' category snapshot
+    /// (moving a project between categories never rewrites history).
+    pub by_category: Vec<ProjectStat>,
 }
 
 // ─── Command payloads ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskInput {
     pub title: String,
     pub pomodoro_target: i64,
     pub priority: TaskPriority,
+    /// v1.2: owning project id (None/empty = standalone task). The legacy
+    /// free-text `project` field is ignored when a project_id is present.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Legacy free-text project field (pre-v1.2 callers).
+    #[serde(default = "default_task_project")]
     pub project: String,
+    /// v1.2: deadline (ISO date string).
+    #[serde(default)]
+    pub deadline: Option<String>,
+    /// v1.2: free notes.
+    #[serde(default)]
+    pub notes: Option<String>,
     /// Primary tag; defaults to the fallback tag for callers predating v1.1.
     #[serde(default = "default_task_tag_id")]
     pub tag_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn default_task_project() -> String {
+    "通用".to_owned()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTaskInput {
     pub id: String,
     pub title: Option<String>,
     pub pomodoro_target: Option<i64>,
     pub priority: Option<TaskPriority>,
+    /// v1.2: move to a project (None = unchanged; empty string detaches).
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub project: Option<String>,
+    /// v1.2: budget recalculation target seconds (writes a `recalc` history
+    /// row; invested time is never touched).
+    #[serde(default)]
+    pub target_seconds: Option<i64>,
+    /// v1.2: deadline (empty string clears).
+    #[serde(default)]
+    pub deadline: Option<String>,
+    /// v1.2: free notes (empty string clears).
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// v1.2: archive/restore (soft delete).
+    #[serde(default)]
+    pub archived: Option<bool>,
     pub done: Option<bool>,
+}
+
+// ─── Categories & projects (v1.2) ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Category {
+    pub id: String,
+    pub profile_id: String,
+    pub name: String,
+    pub status: String,
+    pub sort_order: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCategoryInput {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCategoryInput {
+    pub id: String,
+    /// Rename (1–20 chars, unique within the profile).
+    pub name: Option<String>,
+    /// -1 moves one slot up, +1 one slot down.
+    pub direction: Option<i64>,
+    /// Archive (soft) / restore.
+    pub archived: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: String,
+    pub profile_id: String,
+    pub category_id: String,
+    /// Display name of the owning category (resolved for the UI).
+    pub category_name: String,
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub plan_start_date: Option<String>,
+    pub due_date: Option<String>,
+    pub sort_order: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Resolved counters for list/detail views.
+    pub task_count: i64,
+    pub done_task_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectInput {
+    pub name: String,
+    pub category_id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub plan_start_date: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProjectInput {
+    pub id: String,
+    pub name: Option<String>,
+    /// Move to another category (same profile only).
+    pub category_id: Option<String>,
+    pub description: Option<String>,
+    /// active | completed | archived
+    pub status: Option<String>,
+    pub plan_start_date: Option<String>,
+    pub due_date: Option<String>,
+}
+
+/// v1.2: real-time task progress (confirmed ledger + provisional segment).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgress {
+    pub task_id: String,
+    pub confirmed_seconds: i64,
+    pub provisional_seconds: i64,
+    pub target_seconds: i64,
+    /// min(1.0, (confirmed + provisional) / target) — 0 when target is 0.
+    pub progress: f64,
+    /// Seconds beyond the budget (only meaningful once progress reaches 1).
+    pub over_seconds: i64,
+}
+
+/// v1.2 B4: complete a task now — freeze + confirm the current segment, mark
+/// the task done and unbind it, keep the main clock paused with its remaining
+/// time. One transaction; retries are idempotent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteTaskInput {
+    pub task_id: String,
+    pub expected_revision: i64,
+    pub active_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteTaskResult {
+    pub task: Task,
+    pub timer: TimerSnapshot,
+    /// Effective ms saved into the (now confirmed) segment, if a segment was
+    /// open for this task in the active session.
+    pub segment_saved_ms: i64,
+    pub newly_completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -7,7 +7,7 @@ use crate::error::CommandError;
 use crate::models::{AppSettings, TimerMode, TimerSnapshot};
 
 /// Bump this whenever a new migration is appended to `MIGRATIONS`.
-const LATEST_SCHEMA_VERSION: u32 = 3;
+const LATEST_SCHEMA_VERSION: u32 = 4;
 
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
@@ -463,6 +463,208 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), CommandError> {
         tx.commit()?;
     }
 
+    if current < 4 {
+        let tx = conn.transaction()?;
+        run_v4_migration(&tx)?;
+        tx.pragma_update(None, "user_version", 4u32)?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Local midnight of migration day is not needed — epoch millis only.
+fn v4_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// v1.2 schema: 类别 → 项目 → 任务 + 时间片段账本 + 档案字段 + 任务预算快照.
+///
+/// - `profiles` starts with a single `local` guest profile (v1.4 activates
+///   account profiles; every business row already carries `profile_id`).
+/// - Default categories 学习/工作/生活/其他 are seeded; `其他` is the fallback.
+/// - Legacy free-text `tasks.project` values are consolidated into real
+///   projects (exact match after trimming, never fuzzy), all landing in the
+///   `其他` category; `通用` tasks become standalone (project_id NULL).
+/// - Task budgets are estimated as `pomodoro_target × 当前专注时长 × 60` with
+///   `budget_source = 'migration'` and a `budget_history` row — an estimate,
+///   never presented as exact history (roadmap §3.1).
+/// - Every eligible historical session gets one `confirmed` focus segment
+///   (effective time = focused_seconds; boundaries approximated from
+///   started_at).
+pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
+    let now = v4_now();
+
+    tx.execute_batch(
+        r#"
+        CREATE TABLE profiles (
+            id         TEXT PRIMARY KEY,
+            kind       TEXT NOT NULL CHECK (kind IN ('guest','account')),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE categories (
+            id              TEXT PRIMARY KEY,
+            profile_id      TEXT NOT NULL REFERENCES profiles(id),
+            name            TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+            sort_order      INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            UNIQUE (profile_id, normalized_name)
+        );
+
+        CREATE TABLE projects (
+            id              TEXT PRIMARY KEY,
+            profile_id      TEXT NOT NULL REFERENCES profiles(id),
+            category_id     TEXT NOT NULL REFERENCES categories(id),
+            name            TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            description     TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','completed','archived')),
+            plan_start_date TEXT,
+            due_date        TEXT,
+            sort_order      INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            UNIQUE (profile_id, normalized_name)
+        );
+        CREATE INDEX idx_projects_category ON projects(category_id);
+
+        CREATE TABLE budget_history (
+            id                 TEXT PRIMARY KEY,
+            task_id            TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            old_target_seconds INTEGER,
+            new_target_seconds INTEGER NOT NULL,
+            source             TEXT NOT NULL CHECK (source IN ('creation','migration','recalc')),
+            created_at         INTEGER NOT NULL
+        );
+        CREATE INDEX idx_budget_history_task ON budget_history(task_id);
+
+        CREATE TABLE focus_segments (
+            id                    TEXT PRIMARY KEY,
+            profile_id            TEXT NOT NULL REFERENCES profiles(id),
+            session_id            TEXT NOT NULL,
+            task_id               TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            project_id_snapshot   TEXT,
+            project_name_snapshot TEXT NOT NULL,
+            category_id_snapshot  TEXT,
+            category_name_snapshot TEXT NOT NULL DEFAULT '',
+            effective_start_ms    INTEGER NOT NULL,
+            effective_end_ms      INTEGER NOT NULL,
+            effective_ms          INTEGER NOT NULL CHECK (effective_ms >= 0),
+            state                 TEXT NOT NULL DEFAULT 'pending'
+                                  CHECK (state IN ('pending','confirmed','void')),
+            created_at            INTEGER NOT NULL
+        );
+        CREATE INDEX idx_segments_session ON focus_segments(session_id);
+        CREATE INDEX idx_segments_task_state ON focus_segments(task_id, state);
+        "#,
+    )?;
+
+    // Local guest profile (single-profile until v1.4).
+    tx.execute(
+        "INSERT INTO profiles (id, kind, created_at, updated_at) VALUES ('local', 'guest', ?1, ?1)",
+        params![now],
+    )?;
+
+    // Default categories; 其他 doubles as the fallback category.
+    for (i, name) in ["学习", "工作", "生活", "其他"].iter().enumerate() {
+        tx.execute(
+            "INSERT INTO categories (id, profile_id, name, normalized_name, status, sort_order, created_at, updated_at)
+             VALUES (?1, 'local', ?2, ?2, 'active', ?3, ?4, ?4)",
+            params![format!("cat-default-{i}"), name, i as i64, now],
+        )?;
+    }
+
+    // Tasks gain the v1.2 columns. SQLite ALTERs only ADD columns.
+    tx.execute_batch(
+        r#"
+        ALTER TABLE tasks ADD COLUMN profile_id TEXT NOT NULL DEFAULT 'local';
+        ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id);
+        ALTER TABLE tasks ADD COLUMN target_seconds INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN budget_source TEXT NOT NULL DEFAULT 'migration';
+        ALTER TABLE tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'todo';
+        ALTER TABLE tasks ADD COLUMN deadline TEXT;
+        ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+        ALTER TABLE sessions ADD COLUMN profile_id TEXT NOT NULL DEFAULT 'local';
+        CREATE INDEX idx_tasks_project ON tasks(project_id);
+        "#,
+    )?;
+
+    // Consolidate identical trimmed legacy project names into real projects
+    // under the fallback category. `通用` and blank stay standalone.
+    tx.execute(
+        "INSERT INTO projects (id, profile_id, category_id, name, normalized_name, sort_order, created_at, updated_at)
+         SELECT 'prj-' || hex(randomblob(8)), 'local',
+                (SELECT id FROM categories WHERE profile_id = 'local' AND name = '其他'),
+                t.pname, t.pname,
+                ROW_NUMBER() OVER (ORDER BY t.pname) - 1, ?1, ?1
+         FROM (SELECT DISTINCT TRIM(project) AS pname FROM tasks) t
+         WHERE t.pname <> '' AND t.pname <> '通用'",
+        params![now],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET project_id = (
+            SELECT p.id FROM projects p
+            WHERE p.profile_id = 'local' AND p.normalized_name = TRIM(tasks.project)
+         )
+         WHERE TRIM(project) <> '' AND TRIM(project) <> '通用'",
+        [],
+    )?;
+
+    // Status mirrors the legacy done flag.
+    tx.execute(
+        "UPDATE tasks SET status = CASE WHEN done = 1 THEN 'done' ELSE 'todo' END",
+        [],
+    )?;
+
+    // Budget snapshot estimated from the user's current focus duration.
+    tx.execute(
+        "UPDATE tasks
+         SET target_seconds = pomodoro_target *
+             COALESCE((SELECT focus_duration_minutes FROM settings WHERE id = 1), 25) * 60",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds, source, created_at)
+         SELECT 'bh-' || hex(randomblob(8)), id, NULL, target_seconds, 'migration', ?1 FROM tasks",
+        params![now],
+    )?;
+
+    // One confirmed segment per eligible historical session (effective time
+    // = focused_seconds; project/category snapshots best-effort from the
+    // migrated task).
+    tx.execute(
+        "INSERT INTO focus_segments (id, profile_id, session_id, task_id,
+                                     project_id_snapshot, project_name_snapshot, category_id_snapshot,
+                                     effective_start_ms, effective_end_ms, effective_ms, state, created_at)
+         SELECT 'seg-' || hex(randomblob(8)), 'local', s.id, s.task_id,
+                t.project_id, s.project_snapshot,
+                (SELECT p.category_id FROM projects p WHERE p.id = t.project_id),
+                s.started_at, s.started_at + s.focused_seconds * 1000, s.focused_seconds * 1000,
+                'confirmed', s.ended_at
+         FROM sessions s LEFT JOIN tasks t ON t.id = s.task_id
+         WHERE s.statistics_eligible = 1 AND s.focused_seconds > 0",
+        [],
+    )?;
+
+    // No dangling references may survive the upgrade.
+    let violations: usize = tx
+        .prepare("PRAGMA foreign_key_check")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .count();
+    if violations > 0 {
+        return Err(CommandError::database(format!(
+            "foreign_key_check reported {violations} violating rows after the v4 migration"
+        )));
+    }
     Ok(())
 }
 
@@ -561,7 +763,7 @@ mod tests {
         run_migrations(&mut conn).expect("re-running migrations should be a no-op");
 
         assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
-        assert_eq!(table_names(&conn).len(), 5);
+        assert_eq!(table_names(&conn).len(), 10);
     }
 
     #[test]
@@ -767,6 +969,97 @@ mod tests {
         assert!(is_healthy(&conn));
         assert_eq!(count(&conn, "settings"), 1);
         assert_eq!(count(&conn, "timer_state"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_with_projects_budgets_and_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v4-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+
+        // Build a genuine v3 database: a task in the free-text project
+        // "Java 面试" and one eligible focus session for it.
+        {
+            let mut conn = Connection::open(&db_path).expect("open");
+            configure(&conn, false).expect("configure");
+            {
+                let tx = conn.transaction().expect("tx");
+                tx.execute_batch(MIGRATION_V1).expect("v1");
+                tx.pragma_update(None, "user_version", 1u32).expect("v1 marker");
+                tx.commit().expect("v1 commit");
+            }
+            {
+                let tx = conn.transaction().expect("tx");
+                tx.execute_batch(MIGRATION_V2).expect("v2");
+                tx.pragma_update(None, "user_version", 2u32).expect("v2 marker");
+                tx.commit().expect("v2 commit");
+            }
+            {
+                let tx = conn.transaction().expect("tx");
+                run_v3_migration(&tx).expect("v3");
+                tx.pragma_update(None, "user_version", 3u32).expect("v3 marker");
+                tx.commit().expect("v3 commit");
+            }
+            seed_defaults(&conn).expect("seed");
+            let fallback: String = conn
+                .query_row("SELECT id FROM tags WHERE is_fallback = 1", [], |r| r.get(0))
+                .expect("fallback tag");
+            conn.execute(
+                "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id, sort_order, created_at, updated_at, completed_at)
+                 VALUES ('task-legacy', '数据库迁移', 0, 2, 'med', 'Java 面试', ?1, 0, 1, 1, NULL)",
+                params![fallback],
+            ).expect("task");
+            conn.execute(
+                "INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id, tag_name_snapshot, mode, status, planned_seconds, focused_seconds, started_at, ended_at, finish_reason, statistics_eligible, qualification_reason)
+                 VALUES ('sess-legacy', 'task-legacy', '数据库迁移', 'Java 面试', ?1, '其他', 'focus', 'completed', 1500, 1200, 1000, 2200, 'elapsed', 1, 'qualified')",
+                params![fallback],
+            ).expect("session");
+        }
+
+        let conn = open_at(&db_path).expect("open_at should migrate v3 → v4");
+        assert_eq!(schema_version(&conn).unwrap(), 4);
+
+        // The free-text project became a real project under 其他.
+        let project: (String, String, String) = conn
+            .query_row(
+                "SELECT p.id, p.name, c.name FROM projects p JOIN categories c ON c.id = p.category_id
+                 WHERE p.normalized_name = 'Java 面试'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("project consolidated");
+        assert_eq!(project.1, "Java 面试");
+        assert_eq!(project.2, "其他");
+
+        // The task links to it and got a budget estimate (2 × 25min × 60).
+        let task: (String, i64, String) = conn
+            .query_row(
+                "SELECT project_id, target_seconds, budget_source FROM tasks WHERE id = 'task-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("task row");
+        assert_eq!(task.0, project.0);
+        assert_eq!(task.1, 2 * 25 * 60);
+        assert_eq!(task.2, "migration");
+
+        // The historical session got one confirmed segment with 20 minutes.
+        let seg: i64 = conn
+            .query_row(
+                "SELECT effective_ms FROM focus_segments WHERE session_id = 'sess-legacy' AND state = 'confirmed'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("segment");
+        assert_eq!(seg, 1_200_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

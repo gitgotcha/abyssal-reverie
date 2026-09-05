@@ -7,7 +7,9 @@ use crate::models::{
     BackupHeader, DeleteTagResult, ExportBundle, ExportBundleV1, FinishTimerInput,
     FinishTimerResult, ImportPreview, ImportSummary, ProjectStat,
     SaveSettingsResult, SessionQuery, SessionStatus, SessionV1, StartTimerInput, Statistics,
-    StatisticsQuery, SwitchTimerModeInput, SwitchTimerTaskInput, SwitchTimerTaskResult, Tag,
+    StatisticsQuery, SwitchTimerModeInput, SwitchTimerTaskInput, SwitchTimerTaskResult,
+    CompleteTaskInput, CompleteTaskResult, TaskProgress, Category, CreateCategoryInput,
+    UpdateCategoryInput, Project, CreateProjectInput, UpdateProjectInput, Tag,
     TagDeletePreview, TagKind, Task, TaskPriority,
     TimerMode, TimerSession, TimerSnapshot, TimerState, UpdateTagInput, UpdateTaskInput,
 };
@@ -39,7 +41,8 @@ pub const MAX_DAILY_GOAL: i64 = 50;
 pub const EXPORT_APP_NAME: &str = "abyssal-reverie";
 pub const EXPORT_SCHEMA_VERSION: u32 = 2;
 
-const TASK_COLUMNS: &str = "id, title, done, pomodoro_target, priority, project, tag_id, \
+const TASK_COLUMNS: &str = "id, title, done, pomodoro_target, priority, project, project_id, \
+                            target_seconds, budget_source, status, deadline, notes, tag_id, \
                             sort_order, created_at, updated_at, completed_at";
 const SESSION_COLUMNS: &str = "id, task_id, task_title_snapshot, project_snapshot, tag_id, \
                                tag_name_snapshot, mode, status, planned_seconds, focused_seconds, \
@@ -110,6 +113,12 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         pomodoro_target: row.get("pomodoro_target")?,
         priority: TaskPriority::parse_str(&priority_text).unwrap_or(TaskPriority::Med),
         project: row.get("project")?,
+        project_id: row.get("project_id")?,
+        target_seconds: row.get("target_seconds")?,
+        budget_source: row.get("budget_source")?,
+        status: row.get("status")?,
+        deadline: row.get("deadline")?,
+        notes: row.get("notes")?,
         tag_id: row.get("tag_id")?,
         sort_order: row.get("sort_order")?,
         created_at: row.get("created_at")?,
@@ -205,6 +214,44 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Task, CommandError> {
     .ok_or_else(|| CommandError::not_found(format!("task {id} not found")))
 }
 
+/// v1.2: legacy free-text project names resolve to a real project row in the
+/// fallback category — created on first use so pre-v1.2 callers keep working.
+/// Empty or `通用` means standalone (returns None).
+fn resolve_or_create_project(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<(String, String)>, CommandError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == DEFAULT_PROJECT {
+        return Ok(None);
+    }
+    if let Some(pair) = conn
+        .query_row(
+            "SELECT id, name FROM projects WHERE profile_id = 'local' AND normalized_name = ?1",
+            params![trimmed],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(Some(pair));
+    }
+    let cat_id: String = conn.query_row(
+        "SELECT id FROM categories WHERE profile_id = 'local' AND name = '其他'",
+        [],
+        |row| row.get(0),
+    )?;
+    let now = now_millis();
+    let id = format!("prj-{}", Uuid::new_v4());
+    conn.execute(
+        "INSERT INTO projects (id, profile_id, category_id, name, normalized_name, description,
+                               status, sort_order, created_at, updated_at)
+         VALUES (?1, 'local', ?2, ?3, ?3, '', 'active',
+                 (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM projects), ?4, ?4)",
+        params![id, cat_id, trimmed, now],
+    )?;
+    Ok(Some((id, trimmed.to_owned())))
+}
+
 pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, CommandError> {
     validate_title(&input.title)?;
     validate_pomodoro_target(input.pomodoro_target)?;
@@ -218,13 +265,34 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
     let (fallback_id, _fallback_name) = fallback_tag(conn)?;
     let tag_id = if input.tag_id.is_empty() { fallback_id } else { input.tag_id.clone() };
 
+    // v1.2: resolve the owning project (display name comes from the project
+    // row) and freeze the budget at creation time from the CURRENT settings.
+    let (project_id, project_name): (Option<String>, String) = match input.project_id.as_deref() {
+        Some(pid) if !pid.is_empty() => {
+            let project = get_project(conn, pid)?;
+            (Some(project.id), project.name)
+        }
+        _ => match resolve_or_create_project(conn, &input.project)? {
+            Some((id, name)) => (Some(id), name),
+            None => (None, DEFAULT_PROJECT.to_owned()),
+        },
+    };
+    let settings = get_settings(conn)?;
+    let target_seconds = input.pomodoro_target * settings.focus_duration_minutes * 60;
+
     let task = Task {
         id: Uuid::new_v4().to_string(),
         title: clean_title(&input.title),
         done: false,
         pomodoro_target: input.pomodoro_target,
         priority: input.priority,
-        project: clean_project(&input.project),
+        project: project_name,
+        project_id,
+        target_seconds,
+        budget_source: "creation".to_owned(),
+        status: "todo".to_owned(),
+        deadline: input.deadline.clone().filter(|d| !d.is_empty()),
+        notes: input.notes.clone().unwrap_or_default(),
         tag_id,
         sort_order,
         created_at: now,
@@ -233,9 +301,10 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
     };
 
     conn.execute(
-        "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
+        "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, project_id,
+                            target_seconds, budget_source, status, deadline, notes, tag_id,
                             sort_order, created_at, updated_at, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             task.id,
             task.title,
@@ -243,6 +312,12 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
             task.pomodoro_target,
             task.priority.as_str(),
             task.project,
+            task.project_id,
+            task.target_seconds,
+            task.budget_source,
+            task.status,
+            task.deadline,
+            task.notes,
             task.tag_id,
             task.sort_order,
             task.created_at,
@@ -251,11 +326,18 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
         ],
     )?;
 
+    conn.execute(
+        "INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds, source, created_at)
+         VALUES (?1, ?2, NULL, ?3, 'creation', ?4)",
+        params![format!("bh-{}", Uuid::new_v4()), task.id, task.target_seconds, now],
+    )?;
+
     Ok(task)
 }
 
 pub fn update_task(conn: &Connection, input: &UpdateTaskInput) -> Result<Task, CommandError> {
     let mut task = get_task(conn, &input.id)?;
+    let now = now_millis();
 
     if let Some(title) = &input.title {
         validate_title(title)?;
@@ -268,33 +350,108 @@ pub fn update_task(conn: &Connection, input: &UpdateTaskInput) -> Result<Task, C
     if let Some(priority) = input.priority {
         task.priority = priority;
     }
-    if let Some(project) = &input.project {
-        task.project = clean_project(project);
+
+    // v1.2: project moves. Empty string detaches (standalone); a real id must
+    // exist. History keeps its occurrence snapshots — only the current
+    // organization changes.
+    let mut budget_recalc: Option<(i64, i64)> = None;
+    if let Some(project_id) = &input.project_id {
+        if project_id.is_empty() {
+            task.project_id = None;
+            task.project = DEFAULT_PROJECT.to_owned();
+        } else {
+            let project = get_project(conn, project_id)?;
+            task.project_id = Some(project.id);
+            task.project = project.name;
+        }
+    } else if let Some(project) = &input.project {
+        // Legacy free-text update: resolve (or create) the project row.
+        match resolve_or_create_project(conn, project)? {
+            Some((id, name)) => {
+                task.project_id = Some(id);
+                task.project = name;
+            }
+            None => {
+                task.project_id = None;
+                task.project = DEFAULT_PROJECT.to_owned();
+            }
+        }
+    }
+
+    // v1.2: budget recalculation — never touches invested time, always
+    // records the previous value.
+    if let Some(target_seconds) = input.target_seconds {
+        if target_seconds <= 0 {
+            return Err(CommandError::validation("target_seconds must be positive"));
+        }
+        if target_seconds != task.target_seconds {
+            budget_recalc = Some((task.target_seconds, target_seconds));
+            task.target_seconds = target_seconds;
+            task.budget_source = "recalc".to_owned();
+        }
+    }
+
+    if let Some(deadline) = &input.deadline {
+        task.deadline = if deadline.is_empty() { None } else { Some(deadline.clone()) };
+    }
+    if let Some(notes) = &input.notes {
+        task.notes = notes.clone();
+    }
+
+    // Archive/restore is a soft delete; done/status stay in sync both ways.
+    if let Some(archived) = input.archived {
+        if archived {
+            task.status = "archived".to_owned();
+        } else if task.status == "archived" {
+            task.status = if task.done { "done".to_owned() } else { "todo".to_owned() };
+        }
     }
     if let Some(done) = input.done {
         if done != task.done {
             task.done = done;
-            task.completed_at = if done { Some(now_millis()) } else { None };
+            task.completed_at = if done { Some(now) } else { None };
+            task.status = if done { "done".to_owned() } else { "todo".to_owned() };
+        }
+    } else if input.archived.is_none() {
+        // Keep status consistent if done was not touched (e.g. after restore).
+        if !task.done && task.status == "done" {
+            task.status = "todo".to_owned();
         }
     }
 
-    task.updated_at = now_millis();
+    task.updated_at = now;
 
     conn.execute(
         "UPDATE tasks SET title = ?1, done = ?2, pomodoro_target = ?3, priority = ?4,
-                          project = ?5, updated_at = ?6, completed_at = ?7
-         WHERE id = ?8",
+                          project = ?5, project_id = ?6, target_seconds = ?7,
+                          budget_source = ?8, status = ?9, deadline = ?10, notes = ?11,
+                          updated_at = ?12, completed_at = ?13
+         WHERE id = ?14",
         params![
             task.title,
             task.done as i64,
             task.pomodoro_target,
             task.priority.as_str(),
             task.project,
+            task.project_id,
+            task.target_seconds,
+            task.budget_source,
+            task.status,
+            task.deadline,
+            task.notes,
             task.updated_at,
             task.completed_at,
             task.id,
         ],
     )?;
+
+    if let Some((old_target, new_target)) = budget_recalc {
+        conn.execute(
+            "INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'recalc', ?5)",
+            params![format!("bh-{}", Uuid::new_v4()), task.id, old_target, new_target, now],
+        )?;
+    }
 
     Ok(task)
 }
@@ -729,6 +886,545 @@ pub fn list_sessions(conn: &Connection, limit: i64) -> Result<Vec<TimerSession>,
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+// ─── Categories & projects (v1.2) ────────────────────────────────────────────
+
+pub const MAX_CATEGORY_NAME_CHARS: usize = 20;
+pub const MAX_PROJECT_NAME_CHARS: usize = 60;
+
+fn category_from_row(row: &Row<'_>) -> rusqlite::Result<Category> {
+    Ok(Category {
+        id: row.get("id")?,
+        profile_id: row.get("profile_id")?,
+        name: row.get("name")?,
+        status: row.get("status")?,
+        sort_order: row.get("sort_order")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+pub fn list_categories(conn: &Connection) -> Result<Vec<Category>, CommandError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, name, status, sort_order, created_at, updated_at
+         FROM categories ORDER BY sort_order, created_at",
+    )?;
+    let rows = stmt.query_map([], category_from_row)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn validate_category_name(raw: &str) -> Result<String, CommandError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(CommandError::validation("category name must not be empty"));
+    }
+    if name.chars().count() > MAX_CATEGORY_NAME_CHARS {
+        return Err(CommandError::validation(format!(
+            "category name must be at most {MAX_CATEGORY_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+pub fn create_category(conn: &Connection, input: &CreateCategoryInput) -> Result<Category, CommandError> {
+    let name = validate_category_name(&input.name)?;
+    let now = now_millis();
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM categories WHERE profile_id = 'local' AND normalized_name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)?;
+    if exists {
+        return Err(CommandError::validation(format!("类别“{name}”已存在")));
+    }
+    let sort_order: i64 = conn
+        .query_row("SELECT COALESCE(MAX(sort_order) + 1, 0) FROM categories", [], |row| row.get(0))
+        .unwrap_or(0);
+    let id = format!("cat-{}", Uuid::new_v4());
+    conn.execute(
+        "INSERT INTO categories (id, profile_id, name, normalized_name, status, sort_order, created_at, updated_at)
+         VALUES (?1, 'local', ?2, ?2, 'active', ?3, ?4, ?4)",
+        params![id, name, sort_order, now],
+    )?;
+    Ok(Category {
+        id,
+        profile_id: "local".to_owned(),
+        name,
+        status: "active".to_owned(),
+        sort_order,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+pub fn update_category(conn: &Connection, input: &UpdateCategoryInput) -> Result<Category, CommandError> {
+    let mut category = conn
+        .query_row(
+            "SELECT id, profile_id, name, status, sort_order, created_at, updated_at
+             FROM categories WHERE id = ?1",
+            params![input.id],
+            category_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| CommandError::not_found(format!("category {} not found", input.id)))?;
+    let now = now_millis();
+
+    if let Some(name) = &input.name {
+        let name = validate_category_name(name)?;
+        let taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE profile_id = 'local' AND normalized_name = ?1 AND id <> ?2",
+                params![name, category.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
+        if taken {
+            return Err(CommandError::validation(format!("类别“{name}”已存在")));
+        }
+        category.name = name;
+    }
+    if let Some(archived) = input.archived {
+        category.status = if archived { "archived".to_owned() } else { "active".to_owned() };
+    }
+    if let Some(direction) = input.direction {
+        // Swap sort_order with the neighbour (atomic within the caller's tx).
+        let neighbour: Option<(String, i64)> = if direction < 0 {
+            conn.query_row(
+                "SELECT id, sort_order FROM categories WHERE sort_order < ?1 ORDER BY sort_order DESC LIMIT 1",
+                params![category.sort_order],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                "SELECT id, sort_order FROM categories WHERE sort_order > ?1 ORDER BY sort_order ASC LIMIT 1",
+                params![category.sort_order],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        };
+        match neighbour {
+            Some((neighbour_id, neighbour_order)) => {
+                conn.execute(
+                    "UPDATE categories SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![category.sort_order, now, neighbour_id],
+                )?;
+                category.sort_order = neighbour_order;
+            }
+            None => {
+                return Err(CommandError::validation("category is already at the edge"));
+            }
+        }
+    }
+    category.updated_at = now;
+    conn.execute(
+        "UPDATE categories SET name = ?1, status = ?2, sort_order = ?3, updated_at = ?4 WHERE id = ?5",
+        params![category.name, category.status, category.sort_order, category.updated_at, category.id],
+    )?;
+    Ok(category)
+}
+
+fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: row.get("id")?,
+        profile_id: row.get("profile_id")?,
+        category_id: row.get("category_id")?,
+        category_name: row.get("category_name")?,
+        name: row.get("name")?,
+        description: row.get("description")?,
+        status: row.get("status")?,
+        plan_start_date: row.get("plan_start_date")?,
+        due_date: row.get("due_date")?,
+        sort_order: row.get("sort_order")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        task_count: row.get("task_count")?,
+        done_task_count: row.get("done_task_count")?,
+    })
+}
+
+const PROJECT_SELECT: &str = "SELECT p.id, p.profile_id, p.category_id, c.name AS category_name,
+        p.name, p.description, p.status, p.plan_start_date, p.due_date, p.sort_order,
+        p.created_at, p.updated_at,
+        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status <> 'archived') AS task_count,
+        (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS done_task_count
+     FROM projects p JOIN categories c ON c.id = p.category_id";
+
+pub fn get_project(conn: &Connection, id: &str) -> Result<Project, CommandError> {
+    conn.query_row(
+        &format!("{PROJECT_SELECT} WHERE p.id = ?1"),
+        params![id],
+        project_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| CommandError::not_found(format!("project {id} not found")))
+}
+
+pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, CommandError> {
+    let mut stmt = conn.prepare(&format!("{PROJECT_SELECT} ORDER BY p.sort_order, p.created_at"))?;
+    let rows = stmt.query_map([], project_from_row)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn validate_project_name(raw: &str) -> Result<String, CommandError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(CommandError::validation("project name must not be empty"));
+    }
+    if name.chars().count() > MAX_PROJECT_NAME_CHARS {
+        return Err(CommandError::validation(format!(
+            "project name must be at most {MAX_PROJECT_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+pub fn create_project(conn: &Connection, input: &CreateProjectInput) -> Result<Project, CommandError> {
+    let name = validate_project_name(&input.name)?;
+    // The category must exist and belong to the same profile (v1.2 C5).
+    conn.query_row(
+        "SELECT id FROM categories WHERE id = ?1 AND profile_id = 'local'",
+        params![input.category_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .ok_or_else(|| CommandError::validation("category not found in this profile"))?;
+
+    let now = now_millis();
+    let taken: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE profile_id = 'local' AND normalized_name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)?;
+    if taken {
+        return Err(CommandError::validation(format!("项目“{name}”已存在")));
+    }
+    let sort_order: i64 = conn
+        .query_row("SELECT COALESCE(MAX(sort_order) + 1, 0) FROM projects", [], |row| row.get(0))
+        .unwrap_or(0);
+    let id = format!("prj-{}", Uuid::new_v4());
+    conn.execute(
+        "INSERT INTO projects (id, profile_id, category_id, name, normalized_name, description,
+                               status, plan_start_date, due_date, sort_order, created_at, updated_at)
+         VALUES (?1, 'local', ?2, ?3, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?8)",
+        params![
+            id,
+            input.category_id,
+            name,
+            input.description.clone().unwrap_or_default(),
+            input.plan_start_date.clone().filter(|d| !d.is_empty()),
+            input.due_date.clone().filter(|d| !d.is_empty()),
+            sort_order,
+            now,
+        ],
+    )?;
+    get_project(conn, &id)
+}
+
+pub fn update_project(conn: &Connection, input: &UpdateProjectInput) -> Result<Project, CommandError> {
+    let mut project = get_project(conn, &input.id)?;
+    let now = now_millis();
+
+    if let Some(name) = &input.name {
+        let name = validate_project_name(name)?;
+        let taken: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE profile_id = 'local' AND normalized_name = ?1 AND id <> ?2",
+                params![name, project.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
+        if taken {
+            return Err(CommandError::validation(format!("项目“{name}”已存在")));
+        }
+        project.name = name;
+    }
+    if let Some(category_id) = &input.category_id {
+        // Moving between categories only changes the project row — tasks
+        // inherit the new category, history keeps its snapshots.
+        conn.query_row(
+            "SELECT id FROM categories WHERE id = ?1 AND profile_id = 'local'",
+            params![category_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| CommandError::validation("category not found in this profile"))?;
+        project.category_id = category_id.clone();
+    }
+    if let Some(description) = &input.description {
+        project.description = description.clone();
+    }
+    if let Some(status) = &input.status {
+        if !["active", "completed", "archived"].contains(&status.as_str()) {
+            return Err(CommandError::validation("project status must be active|completed|archived"));
+        }
+        if *status == "completed" && project.done_task_count < project.task_count {
+            return Err(CommandError::validation(format!(
+                "项目还有 {} 项未完成任务，不能直接标记完成",
+                project.task_count - project.done_task_count
+            )));
+        }
+        project.status = status.clone();
+    }
+    if let Some(date) = &input.plan_start_date {
+        project.plan_start_date = if date.is_empty() { None } else { Some(date.clone()) };
+    }
+    if let Some(date) = &input.due_date {
+        project.due_date = if date.is_empty() { None } else { Some(date.clone()) };
+    }
+    project.updated_at = now;
+
+    conn.execute(
+        "UPDATE projects SET name = ?1, category_id = ?2, description = ?3, status = ?4,
+                             plan_start_date = ?5, due_date = ?6, updated_at = ?7
+         WHERE id = ?8",
+        params![
+            project.name,
+            project.category_id,
+            project.description,
+            project.status,
+            project.plan_start_date,
+            project.due_date,
+            project.updated_at,
+            project.id,
+        ],
+    )?;
+    get_project(conn, &project.id)
+}
+
+// ─── Focus segments (v1.2) ──────────────────────────────────────────────────
+
+/// Opens a `pending` segment for the active session. `effective_end_ms = 0`
+/// marks the segment as OPEN (still accumulating).
+pub fn open_segment(
+    conn: &Connection,
+    session_id: &str,
+    task: Option<&Task>,
+    now: i64,
+) -> Result<(), CommandError> {
+    let (task_id, project_id, project_name, category_id, category_name): (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+    ) = match task {
+        Some(t) => {
+            let (category_id, category_name): (Option<String>, String) = match &t.project_id {
+                Some(pid) => conn
+                    .query_row(
+                        "SELECT c.id, c.name FROM projects p JOIN categories c ON c.id = p.category_id
+                         WHERE p.id = ?1",
+                        params![pid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?
+                    .unwrap_or((None, String::new())),
+                None => (None, String::new()),
+            };
+            (Some(t.id.clone()), t.project_id.clone(), t.project.clone(), category_id, category_name)
+        }
+        None => (None, None, NO_TASK_PROJECT.to_owned(), None, String::new()),
+    };
+    conn.execute(
+        "INSERT INTO focus_segments (id, profile_id, session_id, task_id,
+                                     project_id_snapshot, project_name_snapshot, category_id_snapshot,
+                                     category_name_snapshot,
+                                     effective_start_ms, effective_end_ms, effective_ms, state, created_at)
+         VALUES (?1, 'local', ?2, ?3, ?4, ?5, ?6, ?8, ?7, 0, 0, 'pending', ?7)",
+        params![
+            format!("seg-{}", Uuid::new_v4()),
+            session_id,
+            task_id,
+            project_id,
+            project_name,
+            category_id,
+            now,
+            category_name,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Closes the session's OPEN segment (if any) at `now`. Returns the effective
+/// milliseconds accumulated by that segment (0 when none was open).
+pub fn close_open_segment(conn: &Connection, session_id: &str, now: i64) -> Result<i64, CommandError> {
+    let open: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT id, effective_start_ms FROM focus_segments
+             WHERE session_id = ?1 AND state = 'pending' AND effective_end_ms = 0
+             ORDER BY created_at DESC LIMIT 1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((id, start)) = open else { return Ok(0) };
+    let ms = (now - start).max(0);
+    conn.execute(
+        "UPDATE focus_segments SET effective_end_ms = ?1, effective_ms = ?2 WHERE id = ?3",
+        params![now, ms, id],
+    )?;
+    Ok(ms)
+}
+
+/// pending → confirmed for every closed segment of the session.
+pub fn confirm_session_segments(conn: &Connection, session_id: &str) -> Result<(), CommandError> {
+    conn.execute(
+        "UPDATE focus_segments SET state = 'confirmed'
+         WHERE session_id = ?1 AND state = 'pending' AND effective_end_ms > 0",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// pending → void (sessions that never qualify, or abandoned rounds).
+pub fn void_session_segments(conn: &Connection, session_id: &str) -> Result<(), CommandError> {
+    conn.execute(
+        "UPDATE focus_segments SET state = 'void' WHERE session_id = ?1 AND state = 'pending'",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// Total effective seconds accumulated by the session's segments. An OPEN
+/// segment contributes up to `now`.
+pub fn session_effective_seconds(conn: &Connection, session_id: &str, now: i64) -> Result<i64, CommandError> {
+    let closed: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments
+         WHERE session_id = ?1 AND state <> 'void' AND effective_end_ms > 0",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    let open: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(?2 - effective_start_ms), 0) FROM focus_segments
+         WHERE session_id = ?1 AND state = 'pending' AND effective_end_ms = 0",
+        params![session_id, now],
+        |row| row.get(0),
+    )?;
+    Ok(((closed + open).max(0)) / 1000)
+}
+
+/// v1.2 B3: real-time task progress — confirmed ledger plus the provisional
+/// (pending) segments, including a live OPEN segment.
+pub fn get_task_progress(conn: &Connection, task_id: &str) -> Result<TaskProgress, CommandError> {
+    let task = get_task(conn, task_id)?;
+    let now = now_millis();
+    let confirmed_ms: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments
+         WHERE task_id = ?1 AND state = 'confirmed'",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let closed_pending_ms: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments
+         WHERE task_id = ?1 AND state = 'pending' AND effective_end_ms > 0",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let open_pending_ms: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(?2 - effective_start_ms), 0) FROM focus_segments
+         WHERE task_id = ?1 AND state = 'pending' AND effective_end_ms = 0",
+        params![task_id, now],
+        |row| row.get(0),
+    )?;
+    let confirmed_seconds = confirmed_ms / 1000;
+    let provisional_seconds = (closed_pending_ms + open_pending_ms).max(0) / 1000;
+    let target = task.target_seconds;
+    let total = confirmed_seconds + provisional_seconds;
+    let progress = if target > 0 { (total as f64 / target as f64).min(1.0) } else { 0.0 };
+    let over = if target > 0 && total > target { total - target } else { 0 };
+    Ok(TaskProgress {
+        task_id: task.id,
+        confirmed_seconds,
+        provisional_seconds,
+        target_seconds: target,
+        progress,
+        over_seconds: over,
+    })
+}
+
+/// v1.2 B4: complete the current task NOW — close the open segment, confirm
+/// the ledger once the session qualifies, mark the task done, unbind it and
+/// keep the main clock PAUSED with its remaining time. Atomic + idempotent.
+pub fn complete_task_now(
+    conn: &mut Connection,
+    input: &CompleteTaskInput,
+) -> Result<CompleteTaskResult, CommandError> {
+    let tx = conn.transaction()?;
+
+    // Idempotency first: a completed task replays without touching the timer.
+    let task = get_task(&tx, &input.task_id)?;
+    if task.done || task.status == "done" {
+        return Ok(CompleteTaskResult {
+            task,
+            timer: get_timer(&tx)?,
+            segment_saved_ms: 0,
+            newly_completed: false,
+        });
+    }
+
+    let mut timer = get_timer(&tx)?;
+    check_revision(&timer, input.expected_revision)?;
+    if timer.mode != TimerMode::Focus {
+        return Err(CommandError::validation("tasks can only be completed during a focus round"));
+    }
+    if timer.selected_task_id.as_deref() != Some(task.id.as_str()) {
+        return Err(CommandError::validation("task is not the timer's current task"));
+    }
+    match &timer.active_session_id {
+        Some(id) if id == &input.active_session_id => {}
+        _ => return Err(CommandError::validation("activeSessionId does not match timer")),
+    }
+    if timer.state != TimerState::Running && timer.state != TimerState::Paused {
+        return Err(CommandError::validation(format!(
+            "complete_task_now requires a running or paused timer, found {:?}",
+            timer.state
+        )));
+    }
+
+    let now = now_millis();
+    let session_id = input.active_session_id.clone();
+
+    // Close the open segment (the user may complete while running or paused).
+    let saved_ms = close_open_segment(&tx, &session_id, now)?;
+    // Confirm the ledger only once the session itself qualifies (v1.2 D-4:
+    // the 30s rule is per SESSION); otherwise segments stay pending until the
+    // session finalizes.
+    let effective_seconds = session_effective_seconds(&tx, &session_id, now)?;
+    if effective_seconds >= MIN_QUALIFYING_FOCUS_SECONDS {
+        confirm_session_segments(&tx, &session_id)?;
+    }
+
+    // Mark the task done — invested time is NEVER padded to the budget.
+    tx.execute(
+        "UPDATE tasks SET done = 1, status = 'done', completed_at = ?1, updated_at = ?1 WHERE id = ?2",
+        params![now, task.id],
+    )?;
+
+    // Unbind + pause: remaining time is preserved for the user's next choice.
+    if timer.state == TimerState::Running {
+        timer.remaining_seconds = live_remaining(&timer, now);
+        timer.target_end_at = None;
+    }
+    timer.state = TimerState::Paused;
+    timer.paused_at = Some(now);
+    timer.selected_task_id = None;
+    timer.task_title_snapshot = Some(NO_TASK_TITLE.to_owned());
+    timer.project_snapshot = Some(NO_TASK_PROJECT.to_owned());
+    timer.revision += 1;
+    timer.updated_at = now;
+    write_timer(&tx, &timer)?;
+
+    let task = get_task(&tx, &task.id)?;
+    let timer = get_timer(&tx)?;
+    tx.commit()?;
+
+    Ok(CompleteTaskResult { task, timer, segment_saved_ms: saved_ms, newly_completed: true })
+}
+
 // ─── Timer state machine (design spec §4) ────────────────────────────────────
 
 /// Computes the snapshot title/project for a timer start, per spec §3.
@@ -907,7 +1603,7 @@ pub fn start_timer(
 
     timer.mode = input.mode;
     timer.state = TimerState::Running;
-    timer.active_session_id = Some(session_id);
+    timer.active_session_id = Some(session_id.clone());
     timer.selected_task_id = input.selected_task_id.clone();
     timer.task_title_snapshot = Some(title_snap);
     timer.project_snapshot = Some(project_snap);
@@ -922,6 +1618,11 @@ pub fn start_timer(
     timer.updated_at = now;
 
     write_timer(&tx, &timer)?;
+    // v1.2 B1: a focus round opens the first (pending) segment — the task's
+    // time ledger starts here. Breaks never open segments.
+    if input.mode == TimerMode::Focus {
+        open_segment(&tx, &session_id, task.as_ref(), now)?;
+    }
     tx.commit()?;
     Ok(timer)
 }
@@ -952,6 +1653,13 @@ pub fn pause_timer(
     timer.updated_at = now;
 
     write_timer(&tx, &timer)?;
+    // v1.2 B1: pausing freezes the open segment — no effective time accrues
+    // while paused (acceptance: 暂停 5 分钟不新增有效时间).
+    if timer.mode == TimerMode::Focus {
+        if let Some(session_id) = &timer.active_session_id {
+            close_open_segment(&tx, session_id, now)?;
+        }
+    }
     tx.commit()?;
     Ok(timer)
 }
@@ -981,6 +1689,14 @@ pub fn resume_timer(
     timer.updated_at = now;
 
     write_timer(&tx, &timer)?;
+    // v1.2 B1: resuming opens a NEW segment that continues the ledger.
+    if timer.mode == TimerMode::Focus {
+        let task = match &timer.selected_task_id {
+            Some(id) => get_task(&tx, id).ok(),
+            None => None,
+        };
+        open_segment(&tx, timer.active_session_id.as_deref().expect("session"), task.as_ref(), now)?;
+    }
     tx.commit()?;
     Ok(timer)
 }
@@ -1007,6 +1723,11 @@ pub fn reset_timer(
             _ => timer.remaining_seconds,
         };
         write_reset_session(&tx, &timer, now)?;
+        // v1.2 B1: an abandoned round voids its unconfirmed segments —
+        // confirmed segments from earlier saves are never touched.
+        if let Some(session_id) = &timer.active_session_id {
+            void_session_segments(&tx, session_id)?;
+        }
     }
 
     let duration = settings.duration_seconds_for_mode(timer.mode);
@@ -1071,44 +1792,23 @@ pub fn switch_timer_mode(
     Ok(timer)
 }
 
-/// `switch_timer_task` (v1.1.2): switch the running/paused round's task.
+/// `switch_timer_task` (v1.2 B2): same-clock task switch.
 ///
-/// One transaction: the current session is closed with its actual focused
-/// time (`manual_finish` semantics — the `finish_reason` CHECK set does not
-/// include a task-switch value, and a mid-round switch IS a manual end), then
-/// a new focus session opens for the chosen task with a full fresh duration.
-/// Task A's history stays with task A. v1.2's segment ledger replaces the
-/// clock reset with same-clock segment splitting.
+/// The main clock does NOT reset: the current task's OPEN segment is closed
+/// (its effective time stays attributed to the old task) and a new OPEN
+/// segment starts for the chosen task. The round's remaining time and
+/// target end are preserved; a paused switch stays paused. Task A's history
+/// never transfers to task B — the segment ledger keeps them separate.
 ///
-/// Idempotency comes before every other check (v1.1 invariant): a replayed
-/// command whose session is already closed returns that session with
-/// `newly_closed = false` instead of conflicting.
+/// Validations match v1.1.2: focus rounds only, running/paused only, the
+/// target task must exist, be open, and differ from the current one.
 pub fn switch_timer_task(
     conn: &mut Connection,
-    settings: &AppSettings,
+    _settings: &AppSettings,
     input: &SwitchTimerTaskInput,
 ) -> Result<SwitchTimerTaskResult, CommandError> {
     let tx = conn.transaction()?;
 
-    // 1) Idempotency first: an already-closed session for this id wins over
-    //    every other check (stale revision included).
-    let existing = tx
-        .query_row(
-            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
-            params![input.active_session_id],
-            session_from_row,
-        )
-        .optional()?;
-    if let Some(session) = existing {
-        let timer = get_timer(&tx)?;
-        return Ok(SwitchTimerTaskResult {
-            timer,
-            closed_session: Some(session),
-            newly_closed: false,
-        });
-    }
-
-    // 2) Validate timer state, active session, revision.
     let mut timer = get_timer(&tx)?;
     check_revision(&timer, input.expected_revision)?;
     if timer.state != TimerState::Running && timer.state != TimerState::Paused {
@@ -1117,17 +1817,16 @@ pub fn switch_timer_task(
             timer.state
         )));
     }
-    match &timer.active_session_id {
-        Some(id) if id == &input.active_session_id => {}
-        _ => return Err(CommandError::validation("activeSessionId does not match timer")),
-    }
-
-    // 3) The new task must exist, be open, and differ from the current one.
     if timer.mode != TimerMode::Focus {
         return Err(CommandError::validation(
             "tasks can only be switched during a focus round",
         ));
     }
+    match &timer.active_session_id {
+        Some(id) if id == &input.active_session_id => {}
+        _ => return Err(CommandError::validation("activeSessionId does not match timer")),
+    }
+
     let new_task = get_task(&tx, &input.new_task_id)?;
     if new_task.done {
         return Err(CommandError::validation(
@@ -1140,69 +1839,33 @@ pub fn switch_timer_task(
     }
 
     let now = now_millis();
+    let session_id = timer.active_session_id.clone().expect("session id");
 
-    // 4) Close the current session with its actual focused time. Drift-free:
-    //    remaining is ceiling-rounded so 29.x seconds never count as 30.
-    let effective_remaining = match timer.state {
-        TimerState::Running => live_remaining(&timer, now),
-        _ => timer.remaining_seconds,
-    };
-    let focused = (timer.duration_seconds - effective_remaining).max(0);
-    write_finished_session(&tx, &timer, now, SessionStatus::Completed, focused, "manual_finish")?;
-    let closed_session = tx
-        .query_row(
-            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
-            params![input.active_session_id],
-            session_from_row,
-        )
-        .optional()?
-        .ok_or_else(|| CommandError::internal("closed session disappeared mid-query"))?;
+    // Close task A's open segment (keeps its effective time under A) and
+    // open task B's ledger. Both are pending until the session finalizes.
+    close_open_segment(&tx, &session_id, now)?;
+    open_segment(&tx, &session_id, Some(&new_task), now)?;
 
-    // 5) Open the new round for the chosen task. A paused switch starts the
-    //    new round paused with a full duration (the user explicitly paused).
-    let duration = settings.duration_seconds_for_mode(TimerMode::Focus);
-    let new_session_id = Uuid::new_v4().to_string();
-    let tag_name: String = tx
-        .query_row(
-            "SELECT name FROM tags WHERE id = ?1",
-            params![new_task.tag_id],
-            |row| row.get(0),
-        )?;
-
-    timer.mode = TimerMode::Focus;
-    timer.active_session_id = Some(new_session_id);
+    // Update the round's snapshots — the clock itself never moves.
     timer.selected_task_id = Some(new_task.id.clone());
     timer.task_title_snapshot = Some(new_task.title.clone());
     timer.project_snapshot = Some(new_task.project.clone());
+    let tag_name: String = tx.query_row(
+        "SELECT name FROM tags WHERE id = ?1",
+        params![new_task.tag_id],
+        |row| row.get(0),
+    )?;
     timer.tag_id = Some(new_task.tag_id.clone());
     timer.tag_name_snapshot = Some(tag_name);
-    timer.duration_seconds = duration;
-    timer.remaining_seconds = duration;
-    match timer.state {
-        TimerState::Running => {
-            timer.started_at = Some(now);
-            timer.target_end_at = Some(now + duration * 1000);
-            timer.paused_at = None;
-        }
-        _ => {
-            // Paused switch → the new round stays paused with a full duration.
-            timer.started_at = Some(now);
-            timer.target_end_at = None;
-            timer.paused_at = Some(now);
-        }
-    }
     timer.revision += 1;
     timer.updated_at = now;
     write_timer(&tx, &timer)?;
 
     tx.commit()?;
 
-    Ok(SwitchTimerTaskResult {
-        timer,
-        closed_session: Some(closed_session),
-        newly_closed: true,
-    })
+    Ok(SwitchTimerTaskResult { timer, closed_session: None, newly_closed: true })
 }
+
 
 /// `complete_timer`: the NATURAL-completion path (running → done). Idempotent
 /// — if a completed session with the same `activeSessionId` already exists,
@@ -1304,6 +1967,19 @@ pub fn complete_timer(
         "too_short"
     };
     let (fallback_id, fallback_name) = fallback_tag(&tx)?;
+
+    // v1.2 B1: close the open segment and settle the ledger — confirmed when
+    // the session qualifies, voided when it does not (sub-30s focus).
+    if timer.mode == TimerMode::Focus {
+        if let Some(session_id) = &timer.active_session_id {
+            close_open_segment(&tx, session_id, now)?;
+            if eligible {
+                confirm_session_segments(&tx, session_id)?;
+            } else {
+                void_session_segments(&tx, session_id)?;
+            }
+        }
+    }
 
     let session = TimerSession {
         id: input.active_session_id.clone(),
@@ -1466,6 +2142,19 @@ pub fn finish_timer(
         "too_short"
     };
     let (fallback_id, fallback_name) = fallback_tag(&tx)?;
+
+    // v1.2 B1: settle the segment ledger with the session (manual finish
+    // confirms a qualifying session's segments; too-short ones are voided).
+    if timer.mode == TimerMode::Focus {
+        if let Some(session_id) = &timer.active_session_id {
+            close_open_segment(&tx, session_id, now)?;
+            if eligible {
+                confirm_session_segments(&tx, session_id)?;
+            } else {
+                void_session_segments(&tx, session_id)?;
+            }
+        }
+    }
 
     let session = TimerSession {
         id: input.active_session_id.clone(),
@@ -1700,6 +2389,42 @@ pub fn get_statistics(
     let focus_session_count = sessions.len() as i64;
     let focus_seconds: i64 = sessions.iter().map(|s| s.focused_seconds).sum();
 
+    // v1.2 D: per-project / per-category attribution comes from the SEGMENT
+    // ledger — after a same-clock switch one session may span several tasks,
+    // and each keeps its own effective time. Sessions without segments
+    // (defensive) fall back to their own frozen snapshots.
+    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seg_project: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    let mut seg_category: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    {
+        let mut seg_stmt = conn.prepare(
+            "SELECT seg.session_id, seg.effective_ms, seg.project_name_snapshot, seg.category_name_snapshot
+             FROM focus_segments seg
+             JOIN sessions s ON s.id = seg.session_id
+             WHERE s.mode = 'focus' AND s.status = 'completed' AND s.statistics_eligible = 1
+               AND s.started_at >= ?1 AND s.started_at < ?2 AND seg.state = 'confirmed'",
+        )?;
+        let rows = seg_stmt.query_map(params![query.from, query.to], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for r in rows {
+            let (sid, ms, project, category) = r?;
+            covered.insert(sid);
+            let pe = seg_project.entry(project).or_insert((0, 0));
+            pe.0 += 1;
+            pe.1 += ms;
+            let cat = if category.is_empty() { "未分类".to_owned() } else { category };
+            let ce = seg_category.entry(cat).or_insert((0, 0));
+            ce.0 += 1;
+            ce.1 += ms;
+        }
+    }
+
     // by_day: bucket each session into the frontend-provided day boundaries.
     let mut by_day_map: std::collections::BTreeMap<String, (i64, i64)> =
         query.days.iter().map(|d| (d.date.clone(), (0, 0))).collect();
@@ -1725,9 +2450,13 @@ pub fn get_statistics(
         })
         .collect();
 
-    // by_project: aggregate across all sessions in range.
-    let mut by_project_map: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    // by_project: aggregate from the segment ledger, falling back to the
+    // session snapshot for sessions that carry no segments.
+    let mut by_project_map = seg_project;
     for s in &sessions {
+        if covered.contains(&s.id) {
+            continue;
+        }
         let entry = by_project_map.entry(s.project_snapshot.clone()).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += s.focused_seconds;
@@ -1772,6 +2501,15 @@ pub fn get_statistics(
 
     let settings = get_settings(conn)?;
 
+    let by_category: Vec<ProjectStat> = seg_category
+        .iter()
+        .map(|(category, (sessions, ms))| ProjectStat {
+            project: category.clone(),
+            sessions: *sessions,
+            focus_seconds: ms / 1000,
+        })
+        .collect();
+
     Ok(Statistics {
         from: query.from,
         to: query.to,
@@ -1783,6 +2521,7 @@ pub fn get_statistics(
         by_day,
         by_project,
     by_tag,
+    by_category,
     })
 }
 
@@ -1854,6 +2593,22 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    let mut cat_stmt = conn.prepare(
+        "SELECT CASE WHEN category_name_snapshot = '' THEN '未分类' ELSE category_name_snapshot END AS cat,
+                COUNT(*) AS segments, COALESCE(SUM(effective_ms), 0) AS ms
+         FROM focus_segments WHERE state = 'confirmed'
+         GROUP BY cat ORDER BY ms DESC, cat ASC",
+    )?;
+    let by_category = cat_stmt
+        .query_map([], |row| {
+            Ok(ProjectStat {
+                project: row.get(0)?,
+                sessions: row.get(1)?,
+                focus_seconds: row.get::<_, i64>(2)? / 1000,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
     let settings = get_settings(conn)?;
 
     Ok(Statistics {
@@ -1867,6 +2622,7 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
         by_day: Vec::new(),
         by_project,
         by_tag,
+        by_category,
     })
 }
 
@@ -1915,6 +2671,12 @@ fn normalize_v1_bundle(v1: ExportBundleV1) -> ExportBundle {
             pomodoro_target: t.pomodoro_target,
             priority: t.priority,
             project: t.project,
+            project_id: None,
+            target_seconds: 0,
+            budget_source: String::new(),
+            status: if t.done { "done".to_owned() } else { "todo".to_owned() },
+            deadline: None,
+            notes: String::new(),
             tag_id: crate::models::FALLBACK_TAG_ID.to_owned(),
             sort_order: t.sort_order,
             created_at: t.created_at,
@@ -2248,6 +3010,8 @@ mod tests {
             priority: TaskPriority::High,
             project: "Abyssal".to_owned(),
             tag_id: String::new(),
+        
+            ..Default::default()
         }
     }
 
@@ -2269,7 +3033,7 @@ mod tests {
     // ─── v1.1.2 stage B: switch_timer_task ───────────────────────────────────
 
     #[test]
-    fn switch_timer_finishes_old_session_and_starts_new_round() {
+    fn switch_timer_keeps_clock_and_splits_segments() {
         let mut conn = db::open_in_memory().expect("database should open");
         let settings = get_settings(&conn).expect("settings");
         let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
@@ -2289,31 +3053,27 @@ mod tests {
         )
         .expect("switch succeeds");
 
-        // The new round belongs to task B with a full fresh duration.
+        // Same clock: remaining time and duration are untouched; only the
+        // task snapshots move to B.
         assert_eq!(result.newly_closed, true);
+        assert!(result.closed_session.is_none(), "no session is written mid-round");
+        assert_eq!(result.timer.remaining_seconds, started.remaining_seconds);
+        assert_eq!(result.timer.duration_seconds, started.duration_seconds);
+        assert_eq!(result.timer.target_end_at, started.target_end_at);
+        assert_eq!(result.timer.active_session_id, started.active_session_id);
         assert_eq!(result.timer.selected_task_id.as_deref(), Some(task_b.id.as_str()));
         assert_eq!(result.timer.task_title_snapshot.as_deref(), Some("任务 B"));
-        assert_eq!(result.timer.project_snapshot.as_deref(), Some("Abyssal"));
-        assert_eq!(result.timer.state, TimerState::Running);
-        assert_eq!(result.timer.duration_seconds, started.duration_seconds);
-        assert_eq!(result.timer.remaining_seconds, started.duration_seconds);
-        assert!(result.timer.revision > old_revision);
-        assert_ne!(result.timer.active_session_id, started.active_session_id);
+        assert_eq!(result.timer.revision, old_revision + 1);
 
-        // The old session is recorded for task A only — history is not moved.
-        let closed = result.closed_session.expect("closed session");
-        assert_eq!(closed.id, started.active_session_id.expect("started session id"));
-        assert_eq!(closed.task_id.as_deref(), Some(task_a.id.as_str()));
-        assert_eq!(closed.task_title_snapshot, "任务 A");
-        assert_eq!(closed.status, SessionStatus::Completed);
-        assert_eq!(closed.finish_reason.as_deref(), Some("manual_finish"));
-        // An instant switch focuses ~0s → below the 30s rule → hidden from
-        // statistics, exactly like a manual finish.
-        assert_eq!(closed.statistics_eligible, Some(false));
-
-        // Activity view must not show the short switch session.
-        let visible = list_sessions(&conn, 50).expect("list");
-        assert!(visible.iter().all(|s| s.id != closed.id));
+        // Ledger: task A holds one CLOSED pending segment, task B an OPEN one.
+        let a_open: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM focus_segments WHERE task_id = ?1 AND effective_end_ms > 0 AND state = 'pending'",
+            params![task_a.id], |row| row.get(0)).expect("a segment");
+        assert_eq!(a_open, 1, "A's closed segment must exist");
+        let b_open: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM focus_segments WHERE task_id = ?1 AND effective_end_ms = 0 AND state = 'pending'",
+            params![task_b.id], |row| row.get(0)).expect("b segment");
+        assert_eq!(b_open, 1, "B's open segment must exist");
     }
 
     #[test]
@@ -2412,32 +3172,60 @@ mod tests {
     }
 
     #[test]
-    fn switch_is_idempotent_on_a_replayed_command() {
+    fn switch_splits_effective_time_between_tasks() {
         let mut conn = db::open_in_memory().expect("database should open");
         let settings = get_settings(&conn).expect("settings");
         let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
         let task_b = insert_task(&conn, &create_input("任务 B")).expect("task B");
         let started = start_focus(&mut conn, &settings, Some(&task_a.id));
         let session_id = started.active_session_id.clone().expect("session id");
-        let input = SwitchTimerTaskInput {
-            expected_revision: started.revision,
-            active_session_id: session_id.clone(),
-            new_task_id: task_b.id.clone(),
-        };
 
-        let first = switch_timer_task(&mut conn, &settings, &input).expect("first switch");
-        // Replay with the ORIGINAL revision: the closed session already
-        // exists, so the command defers to it instead of conflicting.
-        let replay = switch_timer_task(&mut conn, &settings, &input).expect("replay");
+        // Simulate 10 minutes of focus: backdate the open segment's start and
+        // the round's clock (both derive from the same wall clock in prod).
+        let now = now_millis();
+        conn.execute(
+            "UPDATE focus_segments SET effective_start_ms = ?1
+             WHERE session_id = ?2 AND state = 'pending' AND effective_end_ms = 0",
+            params![now - 600_000, session_id],
+        ).expect("backdate segment");
+        conn.execute(
+            "UPDATE timer_state SET started_at = ?1, target_end_at = target_end_at - 600_000 WHERE id = 1",
+            params![now - 600_000],
+        ).expect("backdate clock");
 
-        assert!(!replay.newly_closed);
-        assert_eq!(replay.timer.active_session_id, first.timer.active_session_id);
-        assert_eq!(replay.timer.revision, first.timer.revision);
-        // Only one closed session exists for the original round.
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions WHERE id = ?1", params![session_id], |row| row.get(0))
-            .expect("count");
-        assert_eq!(count, 1);
+        let result = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: session_id.clone(),
+                new_task_id: task_b.id.clone(),
+            },
+        )
+        .expect("switch");
+
+        // A's ledger closed with ~10 minutes; the clock kept its remaining.
+        let a_ms: i64 = conn.query_row(
+            "SELECT effective_ms FROM focus_segments WHERE task_id = ?1 AND effective_end_ms > 0",
+            params![task_a.id], |row| row.get(0)).expect("a ms");
+        assert!((a_ms - 600_000).abs() <= 1_000, "A segment ~10min, got {a_ms}");
+        assert_eq!(result.timer.target_end_at, started.target_end_at.map(|t| t - 600_000));
+
+        // Manual finish settles the session: eligible (≥30s) → segments confirm.
+        let finished = finish_timer(
+            &mut conn,
+            &FinishTimerInput { expected_revision: result.timer.revision, active_session_id: session_id },
+        )
+        .expect("finish");
+        assert!(finished.statistics_eligible);
+
+        // A keeps its 10 minutes; nothing transfers to B.
+        let pa = get_task_progress(&conn, &task_a.id).expect("progress A");
+        assert!((pa.confirmed_seconds - 600).abs() <= 1, "A confirmed ~600s, got {}", pa.confirmed_seconds);
+        let pb = get_task_progress(&conn, &task_b.id).expect("progress B");
+        assert_eq!(pb.confirmed_seconds, 0, "B has no confirmed time");
+        // Personal total = union of segments (A 10min + B ~0min), not a full round.
+        assert!(finished.session.focused_seconds >= 600);
     }
 
     #[test]
@@ -2465,6 +3253,187 @@ mod tests {
         assert_eq!(result.timer.state, TimerState::Running);
     }
 
+
+    // ─── v1.2: budget, ledger & complete_task_now ────────────────────────────
+
+    #[test]
+    fn created_tasks_freeze_a_budget_snapshot() {
+        let conn = db::open_in_memory().expect("db");
+        let settings = get_settings(&conn).expect("settings");
+
+        let task = insert_task(&conn, &CreateTaskInput {
+            title: "学习二叉树".to_owned(),
+            pomodoro_target: 2,
+            priority: TaskPriority::Med,
+            project: "通用".to_owned(),
+            tag_id: String::new(),
+            ..Default::default()
+        })
+        .expect("task");
+
+        // 2 × 25min × 60 = 3000s, frozen at creation from current settings.
+        assert_eq!(task.target_seconds, 2 * settings.focus_duration_minutes * 60);
+        assert_eq!(task.budget_source, "creation");
+        assert_eq!(task.status, "todo");
+        let history: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM budget_history WHERE task_id = ?1 AND source = 'creation'",
+            params![task.id], |row| row.get(0)).expect("history");
+        assert_eq!(history, 1);
+    }
+
+    #[test]
+    fn recalc_budget_records_history_and_keeps_invested_time() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("预算重算")).expect("task");
+        let old_target = task.target_seconds;
+
+        let updated = update_task(&conn, &UpdateTaskInput {
+            id: task.id.clone(),
+            target_seconds: Some(old_target + 1200),
+            ..Default::default()
+        })
+        .expect("recalc");
+
+        assert_eq!(updated.target_seconds, old_target + 1200);
+        assert_eq!(updated.budget_source, "recalc");
+        let rows: (i64, i64) = conn.query_row(
+            "SELECT old_target_seconds, new_target_seconds FROM budget_history
+             WHERE task_id = ?1 AND source = 'recalc'",
+            params![task.id], |row| Ok((row.get(0)?, row.get(1)?))).expect("history");
+        assert_eq!(rows, (old_target, old_target + 1200));
+    }
+
+    #[test]
+    fn complete_task_now_saves_segment_and_unbinds_clock() {
+        let mut conn = db::open_in_memory().expect("db");
+        let settings = get_settings(&conn).expect("settings");
+        let task = insert_task(&conn, &create_input("完成任务")).expect("task");
+        let started = start_focus(&mut conn, &settings, Some(&task.id));
+        let session_id = started.active_session_id.clone().expect("session");
+
+        // Simulate 15 focused minutes.
+        let now = now_millis();
+        conn.execute(
+            "UPDATE focus_segments SET effective_start_ms = ?1
+             WHERE session_id = ?2 AND effective_end_ms = 0",
+            params![now - 900_000, session_id],
+        ).expect("backdate");
+        conn.execute(
+            "UPDATE timer_state SET started_at = ?1, target_end_at = target_end_at - 900_000 WHERE id = 1",
+            params![now - 900_000],
+        ).expect("backdate clock");
+
+        let result = complete_task_now(&mut conn, &CompleteTaskInput {
+            task_id: task.id.clone(),
+            expected_revision: started.revision,
+            active_session_id: session_id.clone(),
+        })
+        .expect("complete");
+
+        assert!(result.newly_completed);
+        assert!(result.task.done);
+        // ~15 minutes saved; the session qualifies (≥30s) so it is confirmed.
+        assert!(result.segment_saved_ms >= 899_000, "saved ms: {}", result.segment_saved_ms);
+        let confirmed: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(effective_ms)/1000,0) FROM focus_segments
+             WHERE task_id = ?1 AND state = 'confirmed'",
+            params![task.id], |row| row.get(0)).expect("confirmed");
+        assert!(confirmed >= 899, "confirmed seconds: {confirmed}");
+
+        // Main clock: PAUSED, remaining preserved, task unbound.
+        assert_eq!(result.timer.state, TimerState::Paused);
+        assert_eq!(result.timer.selected_task_id, None);
+        assert_eq!(result.timer.task_title_snapshot.as_deref(), Some(NO_TASK_TITLE));
+        assert_eq!(result.timer.remaining_seconds, started.duration_seconds - 900);
+
+        // Idempotent replay.
+        let replay = complete_task_now(&mut conn, &CompleteTaskInput {
+            task_id: task.id.clone(),
+            expected_revision: result.timer.revision,
+            active_session_id: session_id,
+        })
+        .expect("replay");
+        assert!(!replay.newly_completed);
+    }
+
+    #[test]
+    fn complete_task_rejects_when_task_is_not_current() {
+        let mut conn = db::open_in_memory().expect("db");
+        let settings = get_settings(&conn).expect("settings");
+        let current = insert_task(&conn, &create_input("当前任务")).expect("task");
+        let other = insert_task(&conn, &create_input("其他任务")).expect("task");
+        let started = start_focus(&mut conn, &settings, Some(&current.id));
+
+        let err = complete_task_now(&mut conn, &CompleteTaskInput {
+            task_id: other.id,
+            expected_revision: started.revision,
+            active_session_id: started.active_session_id.clone().expect("session"),
+        })
+        .expect_err("non-current task must fail");
+        assert_eq!(err.code, crate::error::ErrorCode::ValidationError);
+    }
+
+    #[test]
+    fn category_and_project_crud_respect_uniqueness_and_completion_rules() {
+        let conn = db::open_in_memory().expect("db");
+        // "学习" already exists as a default category — duplicate names reject.
+        let dup = create_category(&conn, &CreateCategoryInput { name: "学习".to_owned() });
+        assert!(dup.is_err());
+
+        let cat = create_category(&conn, &CreateCategoryInput { name: "开发".to_owned() })
+            .expect("create category");
+        let project = create_project(&conn, &CreateProjectInput {
+            name: "RDS 迭代 V2".to_owned(),
+            category_id: cat.id.clone(),
+            description: None,
+            plan_start_date: None,
+            due_date: Some("2026-09-20".to_owned()),
+        })
+        .expect("create project");
+        assert_eq!(project.category_name, "开发");
+        assert_eq!(project.task_count, 0);
+
+        // Rename keeps the same stable id.
+        let renamed = update_project(&conn, &UpdateProjectInput {
+            id: project.id.clone(),
+            name: Some("RDS 迭代 V3".to_owned()),
+            category_id: None, description: None, status: None,
+            plan_start_date: None, due_date: None,
+        })
+        .expect("rename");
+        assert_eq!(renamed.id, project.id);
+
+        // Project completion requires all tasks done (3 tasks, 1 done → 1/3).
+        for title in ["a", "b", "c"] {
+            insert_task(&conn, &CreateTaskInput {
+                title: title.to_owned(),
+                pomodoro_target: 1,
+                priority: TaskPriority::Med,
+                project_id: Some(project.id.clone()),
+                project: "通用".to_owned(),
+                tag_id: String::new(),
+                ..Default::default()
+            })
+            .expect("task");
+        }
+        let tasks = list_tasks(&conn).expect("list");
+        update_task(&conn, &UpdateTaskInput {
+            id: tasks[0].id.clone(),
+            done: Some(true),
+            ..Default::default()
+        })
+        .expect("done one");
+        let refreshed = get_project(&conn, &project.id).expect("project");
+        assert_eq!((refreshed.task_count, refreshed.done_task_count), (3, 1));
+        let early = update_project(&conn, &UpdateProjectInput {
+            id: project.id.clone(),
+            status: Some("completed".to_owned()),
+            name: None, category_id: None, description: None,
+            plan_start_date: None, due_date: None,
+        })
+        .expect_err("cannot complete with open tasks");
+        assert_eq!(early.code, crate::error::ErrorCode::ValidationError);
+    }
     // ─── v1.1.2 stage D: half-open [from, to) statistics range ──────────────
 
     /// Seeds an eligible focus session with explicit timestamps (the generic
@@ -2628,6 +3597,8 @@ mod tests {
                 priority: Some(TaskPriority::Low),
                 project: None,
                 done: None,
+            
+                ..Default::default()
             },
         )
         .expect("update");
@@ -2652,6 +3623,8 @@ mod tests {
                 priority: None,
                 project: None,
                 done: Some(true),
+            
+                ..Default::default()
             },
         )
         .expect("update");
@@ -2667,6 +3640,8 @@ mod tests {
                 priority: None,
                 project: None,
                 done: Some(false),
+            
+                ..Default::default()
             },
         )
         .expect("update");
@@ -2687,6 +3662,8 @@ mod tests {
                 priority: None,
                 project: None,
                 done: None,
+            
+                ..Default::default()
             },
         );
         assert!(matches!(update, Err(err) if err.code == crate::error::ErrorCode::NotFound));
@@ -2926,10 +3903,11 @@ mod tests {
         for i in 0..2 {
             insert_task(&conn, &CreateTaskInput {
                 title: format!("任务{i}"),
-            tag_id: String::new(),
                 pomodoro_target: 1,
                 priority: TaskPriority::Med,
                 project: "通用".to_owned(),
+                tag_id: String::new(),
+                ..Default::default()
             })
             .expect("task");
             conn.execute("UPDATE tasks SET tag_id = ?1 WHERE title = ?2", params![tag.id, format!("任务{i}")])
@@ -2956,6 +3934,8 @@ mod tests {
             pomodoro_target: 1,
             priority: TaskPriority::Med,
             project: "通用".to_owned(),
+        
+            ..Default::default()
         })
         .expect("task");
         conn.execute("UPDATE tasks SET tag_id = ?1", params![tag.id]).expect("attach");
@@ -3031,6 +4011,8 @@ mod tests {
             pomodoro_target: 1,
             priority: TaskPriority::Med,
             project: "通用".to_owned(),
+        
+            ..Default::default()
         })
         .expect("task");
         conn.execute("UPDATE tasks SET tag_id = ?1 WHERE title = '带标签的任务'", params![tag.id])
@@ -3319,6 +4301,8 @@ mod tests {
             pomodoro_target: 3,
             priority: TaskPriority::High,
             project: "Backend".to_owned(),
+        
+            ..Default::default()
         }).expect("task");
 
         let timer = start_timer(&mut conn, &settings(), &StartTimerInput {
@@ -4110,6 +5094,8 @@ mod tests {
             pomodoro_target: 6,
             priority: TaskPriority::Low,
             project: "Archive".to_owned(),
+        
+            ..Default::default()
         }).expect("insert");
 
         let mut timer = start_timer(&mut conn, &settings(), &StartTimerInput {
@@ -4193,6 +5179,8 @@ mod tests {
             pomodoro_target: 2,
             priority: TaskPriority::High,
             project: "Real".to_owned(),
+        
+            ..Default::default()
         }).expect("seed task");
         seed_session(&conn, "real-session", TimerMode::Focus, SessionStatus::Completed, "Real", 1500);
 

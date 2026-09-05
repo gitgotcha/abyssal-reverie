@@ -106,6 +106,56 @@ pub fn delete_task(state: State<'_, AppState>, id: String) -> Result<(), Command
     repository::delete_task(&conn, &id)
 }
 
+// ─── Categories, projects & task ledger (v1.2) ──────────────────────────────
+
+#[tauri::command]
+pub fn list_categories(state: State<'_, AppState>) -> Result<Vec<crate::models::Category>, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::list_categories(&conn)
+}
+
+#[tauri::command]
+pub fn create_category(state: State<'_, AppState>, input: crate::models::CreateCategoryInput) -> Result<crate::models::Category, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::create_category(&conn, &input)
+}
+
+#[tauri::command]
+pub fn update_category(state: State<'_, AppState>, input: crate::models::UpdateCategoryInput) -> Result<crate::models::Category, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::update_category(&conn, &input)
+}
+
+#[tauri::command]
+pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<crate::models::Project>, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::list_projects(&conn)
+}
+
+#[tauri::command]
+pub fn create_project(state: State<'_, AppState>, input: crate::models::CreateProjectInput) -> Result<crate::models::Project, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::create_project(&conn, &input)
+}
+
+#[tauri::command]
+pub fn update_project(state: State<'_, AppState>, input: crate::models::UpdateProjectInput) -> Result<crate::models::Project, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::update_project(&conn, &input)
+}
+
+#[tauri::command]
+pub fn get_task_progress(state: State<'_, AppState>, task_id: String) -> Result<crate::models::TaskProgress, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::get_task_progress(&conn, &task_id)
+}
+
+#[tauri::command]
+pub fn complete_task_now(state: State<'_, AppState>, input: crate::models::CompleteTaskInput) -> Result<crate::models::CompleteTaskResult, CommandError> {
+    let mut conn = lock_db(&state)?;
+    repository::complete_task_now(&mut conn, &input)
+}
+
 #[tauri::command]
 pub fn save_settings(state: State<'_, AppState>, input: AppSettings) -> Result<SaveSettingsResult, CommandError> {
     let conn = lock_db(&state)?;
