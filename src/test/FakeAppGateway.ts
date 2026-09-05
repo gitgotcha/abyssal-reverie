@@ -21,6 +21,8 @@ import type {
   StatisticsDayBoundary,
   StatisticsQuery,
   SwitchTimerModeInput,
+  SwitchTimerTaskInput,
+  SwitchTimerTaskResult,
   Tag,
   TagDeletePreview,
   Task,
@@ -64,6 +66,7 @@ export class FakeAppGateway implements AppGateway {
     { id: 'system-other', name: '其他', kind: 'system', isFallback: true, sortOrder: 3, createdAt: 0, updatedAt: 0 },
   ]
   private failures: InjectedError[] = []
+  private timerExpiredHandler: ((payload: TimerExpiredPayload) => void) | null = null
 
   /** Queue an error that the next gateway call will reject with. */
   injectFailure(code: string, message = 'injected failure'): void {
@@ -154,7 +157,8 @@ export class FakeAppGateway implements AppGateway {
       tags: this.tags,
       settings: this.settings,
       timer: this.timer,
-      sessions: this.sessions,
+      // Rust's bootstrap lists sessions newest-first (`started_at DESC`).
+      sessions: [...this.sessions].sort((a, b) => b.startedAt - a.startedAt),
       statistics: this.computeStatistics({ from: 0, to: Date.now(), days: [] }),
     }
   }
@@ -163,11 +167,17 @@ export class FakeAppGateway implements AppGateway {
     this.takeFailure()
     const durationSeconds = durationSecondsForMode(input.mode, this.settings)
     const now = Date.now()
+    const task = this.tasks.find(t => t.id === input.selectedTaskId)
     this.timer = {
       ...this.timer,
       mode: input.mode,
       state: 'running',
+      activeSessionId: nextId('session'),
       selectedTaskId: input.selectedTaskId,
+      taskTitleSnapshot: input.mode === 'focus'
+        ? (task?.title ?? '未指定任务')
+        : (input.mode === 'short' ? '短休' : '长休'),
+      projectSnapshot: input.mode === 'focus' ? (task?.project ?? '通用') : '休息',
       durationSeconds,
       remainingSeconds: durationSeconds,
       startedAt: now,
@@ -216,8 +226,7 @@ export class FakeAppGateway implements AppGateway {
     return this.timer
   }
 
-  async switchTimerMode(input: SwitchTimerModeInput): Promise<TimerSnapshot> {
-    this.takeFailure()
+  async switchTimerMode(input: SwitchTimerModeInput): Promise<TimerSnapshot> {    this.takeFailure()
     const now = Date.now()
 
     // Mirrors the Rust machine: switching submits a started session
@@ -257,10 +266,97 @@ export class FakeAppGateway implements AppGateway {
     return this.timer
   }
 
+  /** v1.1.2: close current session + open a new round for the task (mirrors
+   *  the Rust semantics: manual-finish eligibility, paused stays paused,
+   *  idempotent replay). */
+  async switchTimerTask(input: SwitchTimerTaskInput): Promise<SwitchTimerTaskResult> {
+    this.takeFailure()
+    const now = Date.now()
+    // Idempotency first: an already-closed session defers to its record.
+    const closed = this.sessions.find(s => s.id === input.activeSessionId)
+    if (closed) {
+      return { timer: this.timer, closedSession: closed, newlyClosed: false }
+    }
+    if (this.timer.state !== 'running' && this.timer.state !== 'paused') {
+      throw new Error('switch_timer_task requires a running or paused timer')
+    }
+    if (this.timer.activeSessionId !== input.activeSessionId) {
+      throw new Error('activeSessionId does not match timer')
+    }
+    const newTask = this.tasks.find(t => t.id === input.newTaskId)
+    if (!newTask) {
+      const error = new Error(`task ${input.newTaskId} not found`) as Error & { code?: string }
+      error.code = 'NOT_FOUND'
+      throw error
+    }
+    if (newTask.done) throw new Error('cannot switch to a completed task')
+    if (this.timer.mode !== 'focus') throw new Error('tasks can only be switched during a focus round')
+    if (this.timer.selectedTaskId === input.newTaskId) {
+      return { timer: this.timer, closedSession: null, newlyClosed: false }
+    }
+
+    const focused = Math.max(
+      0,
+      this.timer.durationSeconds - this.timer.remainingSeconds,
+    )
+    const eligible = focused >= 30
+    const session: TimerSession = {
+      id: input.activeSessionId,
+      taskId: this.timer.selectedTaskId,
+      taskTitleSnapshot: this.timer.taskTitleSnapshot ?? '未指定任务',
+      projectSnapshot: this.timer.projectSnapshot ?? '通用',
+      tagId: this.timer.tagId ?? 'system-other',
+      tagNameSnapshot: this.timer.tagNameSnapshot ?? '其他',
+      mode: this.timer.mode,
+      status: 'completed',
+      plannedSeconds: this.timer.durationSeconds,
+      focusedSeconds: focused,
+      startedAt: this.timer.startedAt ?? now,
+      endedAt: now,
+      finishReason: 'manual_finish',
+      statisticsEligible: eligible,
+      qualificationReason: eligible ? 'qualified' : 'too_short',
+    }
+    this.sessions = [...this.sessions, session]
+
+    const durationSeconds = durationSecondsForMode('focus', this.settings)
+    this.timer = {
+      ...this.timer,
+      mode: 'focus',
+      state: this.timer.state,
+      activeSessionId: nextId('session'),
+      selectedTaskId: newTask.id,
+      taskTitleSnapshot: newTask.title,
+      projectSnapshot: newTask.project,
+      durationSeconds,
+      remainingSeconds: durationSeconds,
+      startedAt: now,
+      targetEndAt: this.timer.state === 'running' ? now + durationSeconds * 1000 : null,
+      pausedAt: this.timer.state === 'paused' ? now : null,
+      revision: this.timer.revision + 1,
+      updatedAt: now,
+    }
+    return { timer: this.timer, closedSession: session, newlyClosed: true }
+  }
+
   async completeTimer(input: CompleteTimerInput): Promise<CompleteTimerResult> {
     this.takeFailure()
     const now = Date.now()
-    const focusedSeconds = this.timer.durationSeconds - this.timer.remainingSeconds
+    // Idempotency first (mirrors Rust): an existing completed session for
+    // this id returns `newlyCompleted: false` and never appends twice.
+    const existing = this.sessions.find(s => s.id === input.activeSessionId)
+    if (existing && input.activeSessionId) {
+      return {
+        timer: this.timer,
+        session: existing,
+        statistics: this.computeStatistics({ from: 0, to: now, days: [] }),
+        newlyCompleted: false,
+      }
+    }
+    // Natural completion means the countdown reached zero: the focused time
+    // is the full round (mirrors Rust, where the deadline guard rejects any
+    // early call).
+    const focusedSeconds = this.timer.durationSeconds
     const session: TimerSession = {
       id: input.activeSessionId || nextId('session'),
       taskId: this.timer.selectedTaskId,
@@ -530,10 +626,25 @@ export class FakeAppGateway implements AppGateway {
     this.lastTrayIndicator = input
   }
 
-  subscribeTimerExpired(_cb: (payload: TimerExpiredPayload) => void): () => void {
-    // No background ticker in the fake; tests drive completion directly.
-    return () => undefined
+  subscribeTimerExpired(cb: (payload: TimerExpiredPayload) => void): () => void {
+    // Store the handler so tests can simulate the Rust backstop event.
+    this.timerExpiredHandler = cb
+    return () => { this.timerExpiredHandler = null }
   }
+
+  /** Test hook: fire the background `timer-expired` event like Rust's ticker. */
+  emitTimerExpired(): void {
+    this.timerExpiredHandler?.({ activeSessionId: this.timer.activeSessionId ?? '', expectedRevision: this.timer.revision })
+  }
+
+  /** Test hook: drop a persisted session directly into the (fake) database. */
+  seedSession(session: TimerSession): void {
+    this.sessions = [...this.sessions, session]
+  }
+
+  /** Test accessors for asserting persisted state without private-field pokes. */
+  get currentTimer(): TimerSnapshot { return this.timer }
+  get currentTasks(): Task[] { return this.tasks }
 
   subscribeTrayAction(_cb: (action: TrayAction) => void): () => void {
     return () => undefined

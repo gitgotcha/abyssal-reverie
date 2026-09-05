@@ -10,4 +10,6 @@ export interface SessionLog {
   status: "completed" | "abandoned";
   /** Tag name frozen at session time (v1.1 §11.6). Null for legacy rows. */
   tag: string | null;
+  /** Raw session start (epoch ms) — the canonical sort key (v1.1.2 C1). */
+  startedAt: number;
 }

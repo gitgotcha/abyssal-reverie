@@ -152,6 +152,7 @@ pub fn run() {
             commands::resume_timer,
             commands::reset_timer,
             commands::switch_timer_mode,
+            commands::switch_timer_task,
             commands::complete_timer,
             commands::finish_timer,
             commands::list_sessions,

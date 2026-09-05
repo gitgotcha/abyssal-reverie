@@ -15,6 +15,7 @@ export function sessionToLog(session: TimerSession): SessionLog {
   const at = new Date(session.startedAt);
   return {
     id: session.id,
+    startedAt: session.startedAt,
     time: `${pad(at.getHours())}:${pad(at.getMinutes())}`,
     duration: Math.round(session.focusedSeconds / 60),
     task: session.taskTitleSnapshot,
@@ -22,6 +23,22 @@ export function sessionToLog(session: TimerSession): SessionLog {
     mode: session.mode,
     status: session.status,
   };
+}
+
+/**
+ * v1.1.2 C1: canonical in-memory order for the activity list — newest FIRST
+ * (matching the backend's `started_at DESC, rowid DESC`), tie-broken by id.
+ * Whatever order records arrive in (bootstrap, append, reload), the newest
+ * record always sits at index 0.
+ */
+export function sortLogsDesc(logs: SessionLog[]): SessionLog[] {
+  return [...logs].sort((a, b) =>
+    (b.startedAt - a.startedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** Head-insert (or replace) a log into the newest-first array, deduped by id. */
+export function upsertLogNewestFirst(logs: SessionLog[], log: SessionLog): SessionLog[] {
+  return sortLogsDesc([log, ...logs.filter(l => l.id !== log.id)]);
 }
 
 /** Only completed focus sessions count toward goals and stats (spec §6). */

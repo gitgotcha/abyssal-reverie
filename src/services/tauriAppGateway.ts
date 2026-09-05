@@ -22,6 +22,8 @@ import type {
   Statistics,
   StatisticsQuery,
   SwitchTimerModeInput,
+  SwitchTimerTaskInput,
+  SwitchTimerTaskResult,
   Tag,
   TagDeletePreview,
   Task,
@@ -40,6 +42,7 @@ export class TauriAppGateway implements AppGateway {
   resumeTimer(input: TimerRevisionInput) { return invoke<TimerSnapshot>('resume_timer', { input }) }
   resetTimer(input: TimerRevisionInput) { return invoke<TimerSnapshot>('reset_timer', { input }) }
   switchTimerMode(input: SwitchTimerModeInput) { return invoke<TimerSnapshot>('switch_timer_mode', { input }) }
+  switchTimerTask(input: SwitchTimerTaskInput) { return invoke<SwitchTimerTaskResult>('switch_timer_task', { input }) }
   completeTimer(input: CompleteTimerInput) { return invoke<CompleteTimerResult>('complete_timer', { input }) }
   finishTimer(input: FinishTimerInput) { return invoke<FinishTimerResult>('finish_timer', { input }) }
   createTask(input: CreateTaskInput) { return invoke<Task>('create_task', { input }) }

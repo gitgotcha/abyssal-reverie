@@ -178,6 +178,21 @@ export interface SwitchTimerModeInput extends TimerRevisionInput {
   mode: TimerMode
 }
 
+/** v1.1.2: switch the active round's task. Closes the current session with
+ *  its actual focused time and opens a new focus session for the chosen
+ *  task, atomically (v1.2 replaces the clock reset with segment splitting). */
+export interface SwitchTimerTaskInput extends TimerRevisionInput {
+  activeSessionId: string
+  newTaskId: string
+}
+
+export interface SwitchTimerTaskResult {
+  timer: TimerSnapshot
+  /** The session closed by this call; null when nothing was closed. */
+  closedSession: TimerSession | null
+  newlyClosed: boolean
+}
+
 export interface CompleteTimerInput extends TimerRevisionInput {
   activeSessionId: string
   recovery?: boolean

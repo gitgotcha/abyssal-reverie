@@ -147,6 +147,19 @@ pub fn switch_timer_mode(state: State<'_, AppState>, input: SwitchTimerModeInput
     repository::switch_timer_mode(&mut conn, &settings, &input)
 }
 
+/// v1.1.2: switch the active round's task — closes the current session with
+/// its actual focused time and opens a new focus session for the chosen task,
+/// atomically.
+#[tauri::command]
+pub fn switch_timer_task(
+    state: State<'_, AppState>,
+    input: crate::models::SwitchTimerTaskInput,
+) -> Result<crate::models::SwitchTimerTaskResult, CommandError> {
+    let mut conn = lock_db(&state)?;
+    let settings = repository::get_settings(&conn)?;
+    repository::switch_timer_task(&mut conn, &settings, &input)
+}
+
 #[tauri::command]
 pub fn complete_timer(state: State<'_, AppState>, input: CompleteTimerInput) -> Result<CompleteTimerResult, CommandError> {
     let mut conn = lock_db(&state)?;

@@ -18,6 +18,8 @@ import type {
   Statistics,
   StatisticsQuery,
   SwitchTimerModeInput,
+  SwitchTimerTaskInput,
+  SwitchTimerTaskResult,
   Tag,
   TagDeletePreview,
   Task,
@@ -36,6 +38,8 @@ export interface AppGateway {
   resumeTimer(input: TimerRevisionInput): Promise<TimerSnapshot>
   resetTimer(input: TimerRevisionInput): Promise<TimerSnapshot>
   switchTimerMode(input: SwitchTimerModeInput): Promise<TimerSnapshot>
+  /** v1.1.2: atomic "close current session + open a new round for the task". */
+  switchTimerTask(input: SwitchTimerTaskInput): Promise<SwitchTimerTaskResult>
   completeTimer(input: CompleteTimerInput): Promise<CompleteTimerResult>
   /** v1.1: manual "结束" — records actual focused time; timer returns to idle. */
   finishTimer(input: FinishTimerInput): Promise<FinishTimerResult>

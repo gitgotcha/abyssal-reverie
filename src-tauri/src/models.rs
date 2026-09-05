@@ -452,6 +452,29 @@ pub struct SwitchTimerModeInput {
     pub mode: TimerMode,
 }
 
+/// `switch_timer_task` input (v1.1.2): switch the round's task mid-session.
+/// v1.1.2 semantics — close the current session (actual focused time, same
+/// qualification rules as a manual finish) and open a new focus session for
+/// the chosen task, in one transaction. v1.2's segment ledger replaces this
+/// with same-clock splitting.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchTimerTaskInput {
+    pub expected_revision: i64,
+    pub active_session_id: String,
+    pub new_task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchTimerTaskResult {
+    pub timer: TimerSnapshot,
+    /// The session closed by this call; `None` when nothing was closed
+    /// (idempotent replay or switch to the already-current task).
+    pub closed_session: Option<TimerSession>,
+    pub newly_closed: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteTimerInput {

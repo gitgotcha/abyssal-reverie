@@ -7,7 +7,8 @@ use crate::models::{
     BackupHeader, DeleteTagResult, ExportBundle, ExportBundleV1, FinishTimerInput,
     FinishTimerResult, ImportPreview, ImportSummary, ProjectStat,
     SaveSettingsResult, SessionQuery, SessionStatus, SessionV1, StartTimerInput, Statistics,
-    StatisticsQuery, SwitchTimerModeInput, Tag, TagDeletePreview, TagKind, Task, TaskPriority,
+    StatisticsQuery, SwitchTimerModeInput, SwitchTimerTaskInput, SwitchTimerTaskResult, Tag,
+    TagDeletePreview, TagKind, Task, TaskPriority,
     TimerMode, TimerSession, TimerSnapshot, TimerState, UpdateTagInput, UpdateTaskInput,
 };
 
@@ -1070,6 +1071,139 @@ pub fn switch_timer_mode(
     Ok(timer)
 }
 
+/// `switch_timer_task` (v1.1.2): switch the running/paused round's task.
+///
+/// One transaction: the current session is closed with its actual focused
+/// time (`manual_finish` semantics — the `finish_reason` CHECK set does not
+/// include a task-switch value, and a mid-round switch IS a manual end), then
+/// a new focus session opens for the chosen task with a full fresh duration.
+/// Task A's history stays with task A. v1.2's segment ledger replaces the
+/// clock reset with same-clock segment splitting.
+///
+/// Idempotency comes before every other check (v1.1 invariant): a replayed
+/// command whose session is already closed returns that session with
+/// `newly_closed = false` instead of conflicting.
+pub fn switch_timer_task(
+    conn: &mut Connection,
+    settings: &AppSettings,
+    input: &SwitchTimerTaskInput,
+) -> Result<SwitchTimerTaskResult, CommandError> {
+    let tx = conn.transaction()?;
+
+    // 1) Idempotency first: an already-closed session for this id wins over
+    //    every other check (stale revision included).
+    let existing = tx
+        .query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+            params![input.active_session_id],
+            session_from_row,
+        )
+        .optional()?;
+    if let Some(session) = existing {
+        let timer = get_timer(&tx)?;
+        return Ok(SwitchTimerTaskResult {
+            timer,
+            closed_session: Some(session),
+            newly_closed: false,
+        });
+    }
+
+    // 2) Validate timer state, active session, revision.
+    let mut timer = get_timer(&tx)?;
+    check_revision(&timer, input.expected_revision)?;
+    if timer.state != TimerState::Running && timer.state != TimerState::Paused {
+        return Err(CommandError::validation(format!(
+            "switch_timer_task requires a running or paused timer, found {:?}",
+            timer.state
+        )));
+    }
+    match &timer.active_session_id {
+        Some(id) if id == &input.active_session_id => {}
+        _ => return Err(CommandError::validation("activeSessionId does not match timer")),
+    }
+
+    // 3) The new task must exist, be open, and differ from the current one.
+    if timer.mode != TimerMode::Focus {
+        return Err(CommandError::validation(
+            "tasks can only be switched during a focus round",
+        ));
+    }
+    let new_task = get_task(&tx, &input.new_task_id)?;
+    if new_task.done {
+        return Err(CommandError::validation(
+            "cannot switch to a completed task; reopen it first",
+        ));
+    }
+    if timer.selected_task_id.as_deref() == Some(input.new_task_id.as_str()) {
+        // Switching to the already-current task changes nothing.
+        return Ok(SwitchTimerTaskResult { timer, closed_session: None, newly_closed: false });
+    }
+
+    let now = now_millis();
+
+    // 4) Close the current session with its actual focused time. Drift-free:
+    //    remaining is ceiling-rounded so 29.x seconds never count as 30.
+    let effective_remaining = match timer.state {
+        TimerState::Running => live_remaining(&timer, now),
+        _ => timer.remaining_seconds,
+    };
+    let focused = (timer.duration_seconds - effective_remaining).max(0);
+    write_finished_session(&tx, &timer, now, SessionStatus::Completed, focused, "manual_finish")?;
+    let closed_session = tx
+        .query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+            params![input.active_session_id],
+            session_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| CommandError::internal("closed session disappeared mid-query"))?;
+
+    // 5) Open the new round for the chosen task. A paused switch starts the
+    //    new round paused with a full duration (the user explicitly paused).
+    let duration = settings.duration_seconds_for_mode(TimerMode::Focus);
+    let new_session_id = Uuid::new_v4().to_string();
+    let tag_name: String = tx
+        .query_row(
+            "SELECT name FROM tags WHERE id = ?1",
+            params![new_task.tag_id],
+            |row| row.get(0),
+        )?;
+
+    timer.mode = TimerMode::Focus;
+    timer.active_session_id = Some(new_session_id);
+    timer.selected_task_id = Some(new_task.id.clone());
+    timer.task_title_snapshot = Some(new_task.title.clone());
+    timer.project_snapshot = Some(new_task.project.clone());
+    timer.tag_id = Some(new_task.tag_id.clone());
+    timer.tag_name_snapshot = Some(tag_name);
+    timer.duration_seconds = duration;
+    timer.remaining_seconds = duration;
+    match timer.state {
+        TimerState::Running => {
+            timer.started_at = Some(now);
+            timer.target_end_at = Some(now + duration * 1000);
+            timer.paused_at = None;
+        }
+        _ => {
+            // Paused switch → the new round stays paused with a full duration.
+            timer.started_at = Some(now);
+            timer.target_end_at = None;
+            timer.paused_at = Some(now);
+        }
+    }
+    timer.revision += 1;
+    timer.updated_at = now;
+    write_timer(&tx, &timer)?;
+
+    tx.commit()?;
+
+    Ok(SwitchTimerTaskResult {
+        timer,
+        closed_session: Some(closed_session),
+        newly_closed: true,
+    })
+}
+
 /// `complete_timer`: the NATURAL-completion path (running → done). Idempotent
 /// — if a completed session with the same `activeSessionId` already exists,
 /// returns it with `newlyCompleted = false`. If an abandoned session exists,
@@ -2112,6 +2246,220 @@ mod tests {
             project: "Abyssal".to_owned(),
             tag_id: String::new(),
         }
+    }
+
+    /// Starts a focus round on `task_id` and returns the fresh timer snapshot.
+    fn start_focus(conn: &mut Connection, settings: &AppSettings, task_id: Option<&str>) -> TimerSnapshot {
+        let timer = get_timer(conn).expect("timer");
+        start_timer(
+            conn,
+            settings,
+            &StartTimerInput {
+                expected_revision: timer.revision,
+                mode: TimerMode::Focus,
+                selected_task_id: task_id.map(str::to_owned),
+            },
+        )
+        .expect("start_timer")
+    }
+
+    // ─── v1.1.2 stage B: switch_timer_task ───────────────────────────────────
+
+    #[test]
+    fn switch_timer_finishes_old_session_and_starts_new_round() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let task_b = insert_task(&conn, &create_input("任务 B")).expect("task B");
+
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+        let old_revision = started.revision;
+
+        let result = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: started.active_session_id.clone().expect("session id"),
+                new_task_id: task_b.id.clone(),
+            },
+        )
+        .expect("switch succeeds");
+
+        // The new round belongs to task B with a full fresh duration.
+        assert_eq!(result.newly_closed, true);
+        assert_eq!(result.timer.selected_task_id.as_deref(), Some(task_b.id.as_str()));
+        assert_eq!(result.timer.task_title_snapshot.as_deref(), Some("任务 B"));
+        assert_eq!(result.timer.project_snapshot.as_deref(), Some("Abyssal"));
+        assert_eq!(result.timer.state, TimerState::Running);
+        assert_eq!(result.timer.duration_seconds, started.duration_seconds);
+        assert_eq!(result.timer.remaining_seconds, started.duration_seconds);
+        assert!(result.timer.revision > old_revision);
+        assert_ne!(result.timer.active_session_id, started.active_session_id);
+
+        // The old session is recorded for task A only — history is not moved.
+        let closed = result.closed_session.expect("closed session");
+        assert_eq!(closed.id, started.active_session_id.expect("started session id"));
+        assert_eq!(closed.task_id.as_deref(), Some(task_a.id.as_str()));
+        assert_eq!(closed.task_title_snapshot, "任务 A");
+        assert_eq!(closed.status, SessionStatus::Completed);
+        assert_eq!(closed.finish_reason.as_deref(), Some("manual_finish"));
+        // An instant switch focuses ~0s → below the 30s rule → hidden from
+        // statistics, exactly like a manual finish.
+        assert_eq!(closed.statistics_eligible, Some(false));
+
+        // Activity view must not show the short switch session.
+        let visible = list_sessions(&conn, 50).expect("list");
+        assert!(visible.iter().all(|s| s.id != closed.id));
+    }
+
+    #[test]
+    fn switch_to_a_missing_task_rolls_back_everything() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+
+        let err = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: started.active_session_id.clone().expect("session id"),
+                new_task_id: "no-such-task".to_owned(),
+            },
+        )
+        .expect_err("missing task must fail");
+
+        assert_eq!(err.code, crate::error::ErrorCode::NotFound);
+        // Nothing was written: timer still on task A, same revision, and the
+        // old session was NOT closed.
+        let timer = get_timer(&conn).expect("timer");
+        assert_eq!(timer.selected_task_id.as_deref(), Some(task_a.id.as_str()));
+        assert_eq!(timer.revision, started.revision);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "no session may be written on a failed switch");
+    }
+
+    #[test]
+    fn switch_while_paused_starts_the_new_round_paused() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let task_b = insert_task(&conn, &create_input("任务 B")).expect("task B");
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+
+        let paused = pause_timer(
+            &mut conn,
+            &crate::models::TimerRevisionInput { expected_revision: started.revision },
+        )
+        .expect("pause");
+
+        let result = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: paused.revision,
+                active_session_id: paused.active_session_id.clone().expect("session id"),
+                new_task_id: task_b.id.clone(),
+            },
+        )
+        .expect("switch while paused");
+
+        assert_eq!(result.timer.state, TimerState::Paused);
+        assert_eq!(result.timer.selected_task_id.as_deref(), Some(task_b.id.as_str()));
+        assert_eq!(result.timer.remaining_seconds, result.timer.duration_seconds);
+        assert!(result.timer.target_end_at.is_none());
+    }
+
+    #[test]
+    fn switch_rejects_stale_revision_and_wrong_active_session() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let task_b = insert_task(&conn, &create_input("任务 B")).expect("task B");
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+        let session_id = started.active_session_id.clone().expect("session id");
+
+        let stale = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision - 1,
+                active_session_id: session_id.clone(),
+                new_task_id: task_b.id.clone(),
+            },
+        )
+        .expect_err("stale revision");
+        assert_eq!(stale.code, crate::error::ErrorCode::Conflict);
+
+        let wrong_session = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: "some-other-session".to_owned(),
+                new_task_id: task_b.id.clone(),
+            },
+        )
+        .expect_err("wrong active session");
+        assert_eq!(wrong_session.code, crate::error::ErrorCode::ValidationError);
+    }
+
+    #[test]
+    fn switch_is_idempotent_on_a_replayed_command() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let task_b = insert_task(&conn, &create_input("任务 B")).expect("task B");
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+        let session_id = started.active_session_id.clone().expect("session id");
+        let input = SwitchTimerTaskInput {
+            expected_revision: started.revision,
+            active_session_id: session_id.clone(),
+            new_task_id: task_b.id.clone(),
+        };
+
+        let first = switch_timer_task(&mut conn, &settings, &input).expect("first switch");
+        // Replay with the ORIGINAL revision: the closed session already
+        // exists, so the command defers to it instead of conflicting.
+        let replay = switch_timer_task(&mut conn, &settings, &input).expect("replay");
+
+        assert!(!replay.newly_closed);
+        assert_eq!(replay.timer.active_session_id, first.timer.active_session_id);
+        assert_eq!(replay.timer.revision, first.timer.revision);
+        // Only one closed session exists for the original round.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions WHERE id = ?1", params![session_id], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn switch_to_the_current_task_is_a_no_op() {
+        let mut conn = db::open_in_memory().expect("database should open");
+        let settings = get_settings(&conn).expect("settings");
+        let task_a = insert_task(&conn, &create_input("任务 A")).expect("task A");
+        let started = start_focus(&mut conn, &settings, Some(&task_a.id));
+        let session_id = started.active_session_id.clone().expect("session id");
+
+        let result = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: session_id,
+                new_task_id: task_a.id.clone(),
+            },
+        )
+        .expect("no-op switch");
+
+        assert!(!result.newly_closed);
+        assert!(result.closed_session.is_none());
+        assert_eq!(result.timer.revision, started.revision);
+        assert_eq!(result.timer.state, TimerState::Running);
     }
 
     fn seed_session(

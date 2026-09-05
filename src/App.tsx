@@ -7,7 +7,7 @@ import { useAppGateway } from "./services/gatewayContext";
 
 import { C, CARD, SIDEBAR_GLASS } from "./features/shared/palette";
 import type { NavSection, SessionLog } from "./features/shared/types";
-import { MODE_LABELS, sessionToLog, isCountedFocus } from "./features/shared/format";
+import { MODE_LABELS, sessionToLog, sortLogsDesc, upsertLogNewestFirst, isCountedFocus } from "./features/shared/format";
 import { playCompletionSound, notifyCompletion } from "./features/shared/notify";
 import { GoalRing } from "./features/timer/GoalRing";
 import { TimerPanel } from "./features/timer/TimerPanel";
@@ -218,6 +218,9 @@ export default function App() {
   const [shortcutConflict, setShortcutConflict] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [resetConfirm, setResetConfirm] = useState(false);
+  // v1.1.2 B2/B3: pending idle selection + the running-switch confirm dialog.
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
+  const [switchConfirm, setSwitchConfirm] = useState<{ taskId: string; title: string } | null>(null);
 
   // Ref mirrors so async callbacks always see the latest snapshot without
   // becoming stale closures.
@@ -240,7 +243,7 @@ export default function App() {
       .then(payload => {
         setTasks(payload.tasks);
         setTags(payload.tags);
-        setLogs(payload.sessions.map(sessionToLog));
+        setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
         setTags(payload.tags);
         setSettings(payload.settings);
         applyTimer(payload.timer);
@@ -273,7 +276,12 @@ export default function App() {
       recovery,
     });
     applyTimer(result.timer);
-    setLogs(p => [...p, sessionToLog(result.session)]);
+    // v1.1.2 C1: append only a genuinely new, statistics-eligible record
+    // (breaks and sub-30s sessions never enter the activity view), head-
+    // inserted (the array is newest-first) and deduped by id.
+    if (result.newlyCompleted && result.session.statisticsEligible) {
+      setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
+    }
 
     if (result.newlyCompleted && !recovery) {
       const s = settingsRef.current;
@@ -286,10 +294,12 @@ export default function App() {
     }
   }, [gateway, applyTimer, runStart]);
 
-  const handleExpire = useCallback(() => {
+  const handleExpire = useCallback(async () => {
     const cur = timerRef.current;
     if (!cur) return;
-    runComplete(cur, false).catch(resync);
+    // v1.1.2 C2: stats refresh AFTER the completion settles — a concurrent
+    // read could observe the pre-completion totals.
+    await runComplete(cur, false).catch(resync);
     refreshStats();
   }, [runComplete, resync, refreshStats]);
 
@@ -298,6 +308,58 @@ export default function App() {
     if (!cur) return;
     runStart(cur, mode, taskId).catch(resync);
   }, [runStart, resync]);
+
+  // v1.1.2 B2/B3: idle clicks just park the selection; a click while a focus
+  // round is running/paused asks for confirmation, then atomically closes the
+  // current session and opens a new round for the chosen task (A's history
+  // stays with A).
+  const handleSelectTask = useCallback((taskId: string) => {
+    const cur = timerRef.current;
+    if (!cur) return;
+    if (cur.state === "running" || cur.state === "paused") {
+      if (cur.mode !== "focus" || !cur.activeSessionId) {
+        setToast("休息轮次不能切换任务");
+        return;
+      }
+      if (cur.selectedTaskId === taskId) return;
+      const target = tasks.find(t => t.id === taskId);
+      if (!target) return;
+      setSwitchConfirm({ taskId, title: target.title });
+      return;
+    }
+    setPendingTaskId(taskId);
+  }, [tasks]);
+
+  const confirmSwitchTask = useCallback(() => {
+    const cur = timerRef.current;
+    const pending = switchConfirm;
+    setSwitchConfirm(null);
+    if (!cur || !pending || !cur.activeSessionId) return;
+    gateway.switchTimerTask({
+      expectedRevision: cur.revision,
+      activeSessionId: cur.activeSessionId,
+      newTaskId: pending.taskId,
+    })
+      .then(result => {
+        applyTimer(result.timer);
+        if (result.newlyClosed && result.closedSession) {
+          const closed = result.closedSession;
+          // v1.1 invariant: the activity view only shows eligible sessions —
+          // a sub-30s switch record stays out of the list and statistics.
+          if (closed.statisticsEligible) {
+            setLogs(p => upsertLogNewestFirst(p, sessionToLog(closed)));
+            refreshStats();
+            setToast(`已保存「${closed.taskTitleSnapshot}」的 ${Math.max(1, Math.round(closed.focusedSeconds / 60))} 分钟，开始新一轮`);
+          } else {
+            setToast(`「${closed.taskTitleSnapshot}」本次不足 30 秒，未计入统计；已开始新一轮`);
+          }
+        }
+      })
+      .catch(() => {
+        resync();
+        setToast("切换任务失败，已恢复当前状态");
+      });
+  }, [gateway, applyTimer, refreshStats, resync, switchConfirm]);
 
   const runRevisionAction = useCallback(async (
     action: "pause" | "resume" | "reset",
@@ -313,7 +375,7 @@ export default function App() {
   // mode switches, both of which write sessions server-side).
   const resyncLogs = useCallback(() => {
     gateway.listSessions({ limit: 50 })
-      .then(sessions => { setLogs(sessions.map(sessionToLog)); })
+      .then(sessions => { setLogs(sortLogsDesc(sessions.map(sessionToLog))); })
       .catch(() => undefined);
   }, [gateway]);
 
@@ -334,7 +396,8 @@ export default function App() {
       .then(result => {
         applyTimer(result.timer);
         if (result.newlyFinished) {
-          setLogs(p => [...p, sessionToLog(result.session)]);
+          // v1.1.2 C1: head-insert (newest-first), deduped by session id.
+          setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
           refreshStats();
           if (result.statisticsEligible) {
             setToast(`已记录 ${Math.max(1, Math.round(result.session.focusedSeconds / 60))} 分钟专注`);
@@ -427,7 +490,7 @@ export default function App() {
         if (cancelled) return;
         setTasks(payload.tasks);
         setTags(payload.tags);
-        setLogs(payload.sessions.map(sessionToLog));
+        setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
         setSettings(payload.settings);
         applyTimer(payload.timer);
         const t = payload.timer;
@@ -494,12 +557,19 @@ export default function App() {
     setTasks(p => p.map(t => (t.id === id ? updated : t)));
   }, [gateway, tasks]);
 
+  // The highlighted task follows the backend while a round exists; while
+  // idle/done-waiting it is the user's pending selection (v1.1.2 B2).
+  const active = timer?.state === "running" || timer?.state === "paused";
+  const selectorTaskId = active ? timer?.selectedTaskId ?? null : pendingTaskId;
+
   const centerContent = (() => {
     switch (nav) {
       case "timer":    return (
         <TimerPanel
           timer={timer}
           tasks={tasks}
+          selectedTaskId={selectorTaskId}
+          onSelectTask={handleSelectTask}
           onStart={handleStart}
           onPause={handlePause}
           onResume={handleResume}
@@ -569,6 +639,16 @@ export default function App() {
             ×
           </button>
         </div>
+      )}
+
+      {switchConfirm && (
+        <ConfirmDialog
+          open
+          message={`切换到「${switchConfirm.title}」？将保存当前任务的已专注时间，并为新任务开始新一轮。`}
+          confirmLabel="切换任务"
+          onConfirm={confirmSwitchTask}
+          onCancel={() => setSwitchConfirm(null)}
+        />
       )}
 
       <Sidebar active={nav} onNav={setNav} />

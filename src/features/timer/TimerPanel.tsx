@@ -8,9 +8,13 @@ import { playCompletionSound, notifyCompletion } from "../shared/notify";
 import { GoalRing } from "./GoalRing";
 import { TimerArc } from "./TimerArc";
 
-export function TimerPanel({ timer, tasks, onStart, onPause, onResume, onReset, onResetRequest, onFinish, onSwitchMode, onExpire }: {
+export function TimerPanel({ timer, tasks, selectedTaskId, onSelectTask, onStart, onPause, onResume, onReset, onResetRequest, onFinish, onSwitchMode, onExpire }: {
   timer: TimerSnapshot | null;
   tasks: Task[];
+  /** v1.1.2 B2: the current task is the backend's snapshot (or the pending
+   *  idle selection owned by App) — never local highlight state. */
+  selectedTaskId: string | null;
+  onSelectTask: (taskId: string) => void;
   onStart: (mode: TimerMode, taskId: string | null) => void;
   onPause: () => void;
   onResume: () => void;
@@ -28,7 +32,6 @@ export function TimerPanel({ timer, tasks, onStart, onPause, onResume, onReset, 
   const mode  = timer?.mode ?? "focus";
   const total = timer?.durationSeconds ?? DEFAULT_SETTINGS.focusDurationMinutes * 60;
 
-  const [selectedTask, setSelected] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Drift-free display tick: refresh `now` while running; remaining derives
@@ -62,7 +65,7 @@ export function TimerPanel({ timer, tasks, onStart, onPause, onResume, onReset, 
 
   const handleStart = () => {
     if (state === "paused") onResume();
-    else if (state === "idle" || state === "done") onStart(mode, selectedTask);
+    else if (state === "idle" || state === "done") onStart(mode, selectedTaskId);
   };
   const handlePause = () => { if (state === "running") onPause(); };
   const active = state === "running" || state === "paused";
@@ -251,9 +254,12 @@ export function TimerPanel({ timer, tasks, onStart, onPause, onResume, onReset, 
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 148, overflowY: "auto" }}>
                 {activeTasks.map(task => {
-                  const sel = selectedTask === task.id;
+                  // v1.1.2 B2: highlight follows the backend snapshot / the
+                  // pending idle selection passed by App — a click while the
+                  // timer runs asks App to switch, it never fakes a highlight.
+                  const sel = selectedTaskId === task.id;
                   return (
-                    <button key={task.id} onClick={() => setSelected(task.id)}
+                    <button key={task.id} onClick={() => onSelectTask(task.id)}
                       className="task-sel-item"
                       style={{
                         position: "relative", overflow: "hidden",
