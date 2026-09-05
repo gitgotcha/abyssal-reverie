@@ -86,7 +86,26 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let db_path = data_dir.join("abyssal-reverie.sqlite");
-            let conn = db::open_at(&db_path)?;
+            // v1.1.2 E2: a database written by a NEWER version must stop the
+            // old program with a clear, actionable message — never migrate it,
+            // never open it read-write, never silently rebuild it.
+            let conn = match db::open_at(&db_path) {
+                Ok(conn) => conn,
+                Err(err) if err.code == crate::error::ErrorCode::DatabaseTooNew => {
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    let _ = app
+                        .dialog()
+                        .message(format!(
+                            "{err}\n\n数据库位置：{}",
+                            db_path.display()
+                        ))
+                        .title("无法启动 Abyssal Reverie")
+                        .kind(MessageDialogKind::Error)
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+                Err(err) => return Err(Box::new(err)),
+            };
             app.manage(AppState { db: Mutex::new(conn) });
 
             tray::build_tray(app.handle())?;

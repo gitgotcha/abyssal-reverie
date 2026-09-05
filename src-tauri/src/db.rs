@@ -284,6 +284,19 @@ pub fn open_at(path: &Path) -> Result<Connection, CommandError> {
         }
     }
 
+    // Phase 0 — v1.1.2 E1: refuse a database written by a NEWER version of
+    // the app BEFORE any pragma or write (including the WAL journal switch in
+    // `configure`) touches the file. The probe connection only reads
+    // `user_version`; `Connection::open` itself never writes. A probe failure
+    // (garbage/corrupt file) falls through to the normal corruption handling
+    // in Phase 1/2.
+    let probe = Connection::open(path).ok().and_then(|conn| schema_version(&conn).ok());
+    if let Some(version) = probe {
+        if version > LATEST_SCHEMA_VERSION {
+            return Err(CommandError::database_too_new(version, LATEST_SCHEMA_VERSION));
+        }
+    }
+
     // Phase 1 — open + configure. An unreadable/unopenable file is treated as
     // corrupt media and goes through the recovery path.
     let mut conn = match open_and_configure(path) {
@@ -754,6 +767,48 @@ mod tests {
         assert!(is_healthy(&conn));
         assert_eq!(count(&conn, "settings"), 1);
         assert_eq!(count(&conn, "timer_state"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_database_is_refused_and_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-toonew-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+
+        // Simulate a database written by a future version: a plain (default
+        // journal mode) SQLite file stamped with a too-new user_version.
+        {
+            let conn = Connection::open(&db_path).expect("create future db");
+            conn.pragma_update(None, "user_version", 99u32).expect("stamp v99");
+        }
+        let before = std::fs::read(&db_path).expect("read before");
+        assert!(!before.is_empty());
+
+        let err = open_at(&db_path).expect_err("a too-new database must be refused");
+        assert_eq!(err.code, crate::error::ErrorCode::DatabaseTooNew);
+        assert!(err.message.contains("99"), "message should carry the on-disk version");
+
+        // Not a single byte may have changed — no WAL sidecar, no journal
+        // switch, no migration attempt.
+        let after = std::fs::read(&db_path).expect("read after");
+        assert_eq!(before, after, "the refused database file must be byte-identical");
+        let sidecars = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.ends_with("-wal") || name.ends_with("-shm") || name.contains(".corrupt-") || name.contains(".bak")
+            })
+            .count();
+        assert_eq!(sidecars, 0, "no sidecar files may be created by the refused open");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

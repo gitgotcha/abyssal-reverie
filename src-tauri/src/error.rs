@@ -10,6 +10,10 @@ pub enum ErrorCode {
     Conflict,
     DatabaseError,
     InternalError,
+    /// v1.1.2 E1: the on-disk database was written by a NEWER version of the
+    /// app. The old program must refuse to open it (no writes at all) rather
+    /// than risk corrupting a schema it does not understand.
+    DatabaseTooNew,
 }
 
 impl ErrorCode {
@@ -20,6 +24,7 @@ impl ErrorCode {
             ErrorCode::Conflict => "CONFLICT",
             ErrorCode::DatabaseError => "DATABASE_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
+            ErrorCode::DatabaseTooNew => "DATABASE_TOO_NEW",
         }
     }
 }
@@ -59,6 +64,16 @@ impl CommandError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self { code: ErrorCode::InternalError, message: message.into() }
+    }
+
+    pub fn database_too_new(current: u32, supported: u32) -> Self {
+        Self {
+            code: ErrorCode::DatabaseTooNew,
+            message: format!(
+                "数据库由更新版本的 Abyssal Reverie 创建（库版本 {current}，本程序最高支持 {supported}）。\
+                 请升级本应用后再启动；数据库文件未被修改。"
+            ),
+        }
     }
 }
 

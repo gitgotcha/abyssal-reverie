@@ -130,7 +130,7 @@ export interface Statistics {
 }
 
 export interface CommandError {
-  code: 'VALIDATION_ERROR' | 'NOT_FOUND' | 'CONFLICT' | 'DATABASE_ERROR' | 'INTERNAL_ERROR'
+  code: 'VALIDATION_ERROR' | 'NOT_FOUND' | 'CONFLICT' | 'DATABASE_ERROR' | 'INTERNAL_ERROR' | 'DATABASE_TOO_NEW'
   message: string
 }
 
