@@ -10,7 +10,20 @@ export interface Task {
   done: boolean
   pomodoroTarget: number
   priority: TaskPriority
+  /** Resolved display project name (通用 for standalone tasks). */
   project: string
+  /** v1.2: owning project row (null = standalone). */
+  projectId: string | null
+  /** v1.2: frozen budget in seconds (预计番茄数 × 创建时单次专注分钟 × 60). */
+  targetSeconds: number
+  /** v1.2: creation | migration | recalc */
+  budgetSource: string
+  /** v1.2: todo | done | archived */
+  status: string
+  /** v1.2: ISO date string or null. */
+  deadline: string | null
+  /** v1.2: free notes. */
+  notes: string
   /** Owning primary tag. v1.1: always present on Rust payloads. */
   tagId: string
   sortOrder: number
@@ -127,6 +140,8 @@ export interface Statistics {
   byDay: Array<{ date: string; sessions: number; focusSeconds: number }>
   byProject: Array<{ project: string; sessions: number; focusSeconds: number }>
   byTag: Array<{ project: string; sessions: number; focusSeconds: number }>
+  /** v1.2: category distribution from the segment ledger's snapshots. */
+  byCategory: Array<{ project: string; sessions: number; focusSeconds: number }>
 }
 
 export interface CommandError {
@@ -155,7 +170,14 @@ export interface CreateTaskInput {
   title: string
   pomodoroTarget: number
   priority: TaskPriority
-  project: string
+  /** v1.2: owning project id (omit/empty = standalone task). */
+  projectId?: string
+  /** Legacy free-text project (pre-v1.2 callers). */
+  project?: string
+  /** v1.2: ISO date string. */
+  deadline?: string
+  /** v1.2: free notes. */
+  notes?: string
   /** Defaults to the fallback tag when omitted. */
   tagId?: string
 }
@@ -163,6 +185,95 @@ export interface CreateTaskInput {
 export interface UpdateTaskInput extends Partial<CreateTaskInput> {
   id: string
   done?: boolean
+  /** v1.2: budget recalculation target seconds (writes a recalc history row). */
+  targetSeconds?: number
+  /** v1.2: archive (soft delete) / restore. */
+  archived?: boolean
+}
+
+// ─── Categories & projects (v1.2) ────────────────────────────────────────────
+
+export interface Category {
+  id: string
+  profileId: string
+  name: string
+  status: string
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface CreateCategoryInput {
+  name: string
+}
+
+export interface UpdateCategoryInput {
+  id: string
+  name?: string
+  /** -1 up, +1 down. */
+  direction?: number
+  archived?: boolean
+}
+
+export interface Project {
+  id: string
+  profileId: string
+  categoryId: string
+  categoryName: string
+  name: string
+  description: string
+  status: string
+  planStartDate: string | null
+  dueDate: string | null
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+  taskCount: number
+  doneTaskCount: number
+}
+
+export interface CreateProjectInput {
+  name: string
+  categoryId: string
+  description?: string
+  planStartDate?: string
+  dueDate?: string
+}
+
+export interface UpdateProjectInput {
+  id: string
+  name?: string
+  categoryId?: string
+  description?: string
+  /** active | completed | archived */
+  status?: string
+  planStartDate?: string
+  dueDate?: string
+}
+
+/** v1.2: real-time task progress. */
+export interface TaskProgress {
+  taskId: string
+  confirmedSeconds: number
+  provisionalSeconds: number
+  targetSeconds: number
+  /** min(1, (confirmed + provisional) / target). */
+  progress: number
+  /** Seconds beyond the budget. */
+  overSeconds: number
+}
+
+export interface CompleteTaskInput {
+  taskId: string
+  expectedRevision: number
+  activeSessionId: string
+}
+
+export interface CompleteTaskResult {
+  task: Task
+  timer: TimerSnapshot
+  segmentSavedMs: number
+  newlyCompleted: boolean
 }
 
 export interface TimerRevisionInput {

@@ -47,26 +47,29 @@ describe('Abyssal Reverie', () => {
     expect(payload.tasks.some((t) => t.title === '编写集成测试')).toBe(true)
   })
 
-  it('deletes a task through the gateway', async () => {
+  it('archives a task through the gateway (soft delete, v1.2 D-7)', async () => {
     const gateway = new FakeAppGateway()
     const user = userEvent.setup()
     renderWithGateway(gateway)
 
-    // Create a task, then delete it via its task-card delete button.
+    // Create a task, then archive it via its row archive button.
     await user.click(screen.getByRole('button', { name: '任务' }))
     const input = await screen.findByPlaceholderText('添加任务…')
     await user.type(input, '临时任务')
     await user.keyboard('{Enter}')
 
     await screen.findByText('临时任务')
-    // The delete button is the one with aria-label="删除任务" inside the same row.
-    const deleteButton = screen.getAllByRole('button', { name: '删除任务' })[0]
-    await user.click(deleteButton)
+    const archiveButton = screen.getByRole('button', { name: '归档任务' })
+    await user.click(archiveButton)
 
+    // The default 待办 filter hides the archived task.
     await waitFor(() => {
       expect(screen.queryByText('临时任务')).not.toBeInTheDocument()
     })
+    // Soft delete: the record survives with status archived.
     const payload = await gateway.bootstrap()
-    expect(payload.tasks.some((t) => t.title === '临时任务')).toBe(false)
+    const archived = payload.tasks.find((t) => t.title === '临时任务')
+    expect(archived).toBeDefined()
+    expect(archived?.status).toBe('archived')
   })
 })

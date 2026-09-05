@@ -4,6 +4,15 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { AppGateway } from './appGateway'
 import type {
   AppSettings,
+  Category,
+  CreateCategoryInput,
+  UpdateCategoryInput,
+  Project,
+  CreateProjectInput,
+  UpdateProjectInput,
+  TaskProgress,
+  CompleteTaskInput,
+  CompleteTaskResult,
   BootstrapPayload,
   CompleteTimerInput,
   CompleteTimerResult,
@@ -48,6 +57,17 @@ export class TauriAppGateway implements AppGateway {
   createTask(input: CreateTaskInput) { return invoke<Task>('create_task', { input }) }
   updateTask(input: UpdateTaskInput) { return invoke<Task>('update_task', { input }) }
   deleteTask(id: string) { return invoke<void>('delete_task', { id }) }
+
+  // ─── Categories, projects & task ledger (v1.2) ────────────────────────────
+  listCategories() { return invoke<Category[]>('list_categories') }
+  createCategory(input: CreateCategoryInput) { return invoke<Category>('create_category', { input }) }
+  updateCategory(input: UpdateCategoryInput) { return invoke<Category>('update_category', { input }) }
+  listProjects() { return invoke<Project[]>('list_projects') }
+  createProject(input: CreateProjectInput) { return invoke<Project>('create_project', { input }) }
+  updateProject(input: UpdateProjectInput) { return invoke<Project>('update_project', { input }) }
+  getTaskProgress(taskId: string) { return invoke<TaskProgress>('get_task_progress', { taskId }) }
+  getAllTaskProgress() { return invoke<TaskProgress[]>('get_all_task_progress') }
+  completeTaskNow(input: CompleteTaskInput) { return invoke<CompleteTaskResult>('complete_task_now', { input }) }
 
   // ─── Tags (v1.1) ──────────────────────────────────────────────────────────
   listTags() { return invoke<Tag[]>('list_tags') }

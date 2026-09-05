@@ -1307,6 +1307,21 @@ pub fn session_effective_seconds(conn: &Connection, session_id: &str, now: i64) 
     Ok(((closed + open).max(0)) / 1000)
 }
 
+/// v1.2: batch progress for every non-archived task (one IPC call for lists).
+pub fn get_all_task_progress(conn: &Connection) -> Result<Vec<TaskProgress>, CommandError> {
+    let tasks: Vec<Task> = conn
+        .prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE status <> 'archived' ORDER BY sort_order, created_at"
+        ))?
+        .query_map([], task_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        out.push(get_task_progress(conn, &task.id)?);
+    }
+    Ok(out)
+}
+
 /// v1.2 B3: real-time task progress — confirmed ledger plus the provisional
 /// (pending) segments, including a live OPEN segment.
 pub fn get_task_progress(conn: &Connection, task_id: &str) -> Result<TaskProgress, CommandError> {

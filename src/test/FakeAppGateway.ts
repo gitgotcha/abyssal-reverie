@@ -2,6 +2,15 @@ import { DEFAULT_SETTINGS, durationSecondsForMode, idleTimerForMode } from '../d
 import type { AppGateway } from '../services/appGateway'
 import type {
   AppSettings,
+  Category,
+  CreateCategoryInput,
+  UpdateCategoryInput,
+  Project,
+  CreateProjectInput,
+  UpdateProjectInput,
+  TaskProgress,
+  CompleteTaskInput,
+  CompleteTaskResult,
   BootstrapPayload,
   CompleteTimerInput,
   CompleteTimerResult,
@@ -65,6 +74,13 @@ export class FakeAppGateway implements AppGateway {
     { id: 'system-life', name: '生活', kind: 'system', isFallback: false, sortOrder: 2, createdAt: 0, updatedAt: 0 },
     { id: 'system-other', name: '其他', kind: 'system', isFallback: true, sortOrder: 3, createdAt: 0, updatedAt: 0 },
   ]
+  private categories: Category[] = [
+    { id: 'cat-study', profileId: 'local', name: '学习', status: 'active', sortOrder: 0, createdAt: 0, updatedAt: 0 },
+    { id: 'cat-work', profileId: 'local', name: '工作', status: 'active', sortOrder: 1, createdAt: 0, updatedAt: 0 },
+    { id: 'cat-life', profileId: 'local', name: '生活', status: 'active', sortOrder: 2, createdAt: 0, updatedAt: 0 },
+    { id: 'cat-other', profileId: 'local', name: '其他', status: 'active', sortOrder: 3, createdAt: 0, updatedAt: 0 },
+  ]
+  private projects: Project[] = []
   private failures: InjectedError[] = []
   private timerExpiredHandler: ((payload: TimerExpiredPayload) => void) | null = null
 
@@ -140,6 +156,7 @@ export class FakeAppGateway implements AppGateway {
       byDay: [...byDay.entries()].map(([date, v]) => ({ date, ...v })),
       byProject: [...byProjectMap.entries()].map(([project, v]) => ({ project, ...v })),
       byTag: [...byTagMap.entries()].map(([project, v]) => ({ project, ...v })),
+      byCategory: [],
     }
   }
 
@@ -266,17 +283,11 @@ export class FakeAppGateway implements AppGateway {
     return this.timer
   }
 
-  /** v1.1.2: close current session + open a new round for the task (mirrors
-   *  the Rust semantics: manual-finish eligibility, paused stays paused,
-   *  idempotent replay). */
+  /** v1.2 B2: same-clock switch — the round keeps its clock and session; the
+   *  ledger attributes time per task via segments. */
   async switchTimerTask(input: SwitchTimerTaskInput): Promise<SwitchTimerTaskResult> {
     this.takeFailure()
     const now = Date.now()
-    // Idempotency first: an already-closed session defers to its record.
-    const closed = this.sessions.find(s => s.id === input.activeSessionId)
-    if (closed) {
-      return { timer: this.timer, closedSession: closed, newlyClosed: false }
-    }
     if (this.timer.state !== 'running' && this.timer.state !== 'paused') {
       throw new Error('switch_timer_task requires a running or paused timer')
     }
@@ -295,48 +306,21 @@ export class FakeAppGateway implements AppGateway {
       return { timer: this.timer, closedSession: null, newlyClosed: false }
     }
 
-    const focused = Math.max(
-      0,
-      this.timer.durationSeconds - this.timer.remainingSeconds,
-    )
-    const eligible = focused >= 30
-    const session: TimerSession = {
-      id: input.activeSessionId,
-      taskId: this.timer.selectedTaskId,
-      taskTitleSnapshot: this.timer.taskTitleSnapshot ?? '未指定任务',
-      projectSnapshot: this.timer.projectSnapshot ?? '通用',
-      tagId: this.timer.tagId ?? 'system-other',
-      tagNameSnapshot: this.timer.tagNameSnapshot ?? '其他',
-      mode: this.timer.mode,
-      status: 'completed',
-      plannedSeconds: this.timer.durationSeconds,
-      focusedSeconds: focused,
-      startedAt: this.timer.startedAt ?? now,
-      endedAt: now,
-      finishReason: 'manual_finish',
-      statisticsEligible: eligible,
-      qualificationReason: eligible ? 'qualified' : 'too_short',
-    }
-    this.sessions = [...this.sessions, session]
-
-    const durationSeconds = durationSecondsForMode('focus', this.settings)
     this.timer = {
       ...this.timer,
-      mode: 'focus',
       state: this.timer.state,
-      activeSessionId: nextId('session'),
+      activeSessionId: input.activeSessionId,
       selectedTaskId: newTask.id,
       taskTitleSnapshot: newTask.title,
       projectSnapshot: newTask.project,
-      durationSeconds,
-      remainingSeconds: durationSeconds,
-      startedAt: now,
-      targetEndAt: this.timer.state === 'running' ? now + durationSeconds * 1000 : null,
+      startedAt: this.timer.startedAt ?? now,
+      targetEndAt: this.timer.targetEndAt,
+      remainingSeconds: this.timer.remainingSeconds,
       pausedAt: this.timer.state === 'paused' ? now : null,
       revision: this.timer.revision + 1,
       updatedAt: now,
     }
-    return { timer: this.timer, closedSession: session, newlyClosed: true }
+    return { timer: this.timer, closedSession: null, newlyClosed: true }
   }
 
   async completeTimer(input: CompleteTimerInput): Promise<CompleteTimerResult> {
@@ -483,13 +467,26 @@ export class FakeAppGateway implements AppGateway {
   async createTask(input: CreateTaskInput): Promise<Task> {
     this.takeFailure()
     const now = Date.now()
+    const projectId = input.projectId?.trim() || null
+    const project = projectId ? this.projects.find((p) => p.id === projectId) : undefined
+    if (projectId && !project) {
+      const error = new Error('project not found') as Error & { code?: string }
+      error.code = 'VALIDATION_ERROR'
+      throw error
+    }
     const task: Task = {
       id: nextId('task'),
       title: input.title,
       done: false,
       pomodoroTarget: input.pomodoroTarget,
       priority: input.priority,
-      project: input.project,
+      project: project?.name ?? '通用',
+      projectId,
+      targetSeconds: input.pomodoroTarget * this.settings.focusDurationMinutes * 60,
+      budgetSource: 'creation',
+      status: 'todo',
+      deadline: input.deadline ?? null,
+      notes: input.notes ?? '',
       tagId: 'system-other',
       sortOrder: this.tasks.length,
       createdAt: now,
@@ -514,12 +511,26 @@ export class FakeAppGateway implements AppGateway {
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.pomodoroTarget !== undefined ? { pomodoroTarget: input.pomodoroTarget } : {}),
       ...(input.priority !== undefined ? { priority: input.priority } : {}),
+      ...(input.projectId !== undefined
+        ? (() => {
+            const project = this.projects.find((p) => p.id === input.projectId)
+            return { projectId: input.projectId || null, project: project?.name ?? '通用' }
+          })()
+        : {}),
       ...(input.project !== undefined ? { project: input.project } : {}),
+      ...(input.targetSeconds !== undefined
+        ? { targetSeconds: input.targetSeconds, budgetSource: 'recalc' }
+        : {}),
+      ...(input.deadline !== undefined ? { deadline: input.deadline || null } : {}),
+      ...(input.notes !== undefined ? { notes: input.notes } : {}),
+      ...(input.archived !== undefined
+        ? { status: input.archived ? 'archived' : target.done ? 'done' : 'todo' }
+        : {}),
       ...(input.done !== undefined
-        ? { done: input.done, completedAt: input.done ? now : null }
+        ? { done: input.done, completedAt: input.done ? now : null, status: input.done ? 'done' : 'todo' }
         : {}),
       updatedAt: now,
-    }
+    } as Task
     this.tasks = this.tasks.map((t) => (t.id === input.id ? updated : t))
     return updated
   }
@@ -616,6 +627,146 @@ export class FakeAppGateway implements AppGateway {
     return this.computeStatistics(query)
   }
 
+  // ─── Categories, projects & task ledger (v1.2, in-memory) ─────────────────
+
+  async listCategories(): Promise<Category[]> {
+    this.takeFailure()
+    return [...this.categories].sort((a, b) => a.sortOrder - b.sortOrder)
+  }
+
+  async createCategory(input: CreateCategoryInput): Promise<Category> {
+    this.takeFailure()
+    const name = input.name.trim()
+    if (!name) throw new Error('类别名称不能为空')
+    if (this.categories.some((c) => c.name === name)) throw new Error(`类别"${name}"已存在`)
+    const now = Date.now()
+    const category: Category = {
+      id: nextId('cat'),
+      profileId: 'local',
+      name,
+      status: 'active',
+      sortOrder: Math.max(...this.categories.map((c) => c.sortOrder), -1) + 1,
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.categories.push(category)
+    return category
+  }
+
+  async updateCategory(input: UpdateCategoryInput): Promise<Category> {
+    this.takeFailure()
+    const category = this.categories.find((c) => c.id === input.id)
+    if (!category) throw new Error(`category ${input.id} not found`)
+    if (input.name !== undefined) category.name = input.name.trim()
+    if (input.archived !== undefined) category.status = input.archived ? 'archived' : 'active'
+    category.updatedAt = Date.now()
+    return category
+  }
+
+  async listProjects(): Promise<Project[]> {
+    this.takeFailure()
+    return [...this.projects]
+  }
+
+  async createProject(input: CreateProjectInput): Promise<Project> {
+    this.takeFailure()
+    const name = input.name.trim()
+    if (!name) throw new Error('项目名称不能为空')
+    if (this.projects.some((p) => p.name === name)) throw new Error(`项目"${name}"已存在`)
+    const now = Date.now()
+    const category = this.categories.find((c) => c.id === input.categoryId)
+    if (!category) throw new Error('category not found')
+    const project: Project = {
+      id: nextId('prj'),
+      profileId: 'local',
+      categoryId: input.categoryId,
+      categoryName: category.name,
+      name,
+      description: input.description ?? '',
+      status: 'active',
+      planStartDate: input.planStartDate ?? null,
+      dueDate: input.dueDate ?? null,
+      sortOrder: this.projects.length,
+      createdAt: now,
+      updatedAt: now,
+      taskCount: 0,
+      doneTaskCount: 0,
+    }
+    this.projects.push(project)
+    return project
+  }
+
+  async updateProject(input: UpdateProjectInput): Promise<Project> {
+    this.takeFailure()
+    const project = this.projects.find((p) => p.id === input.id)
+    if (!project) throw new Error(`project ${input.id} not found`)
+    if (input.name !== undefined) project.name = input.name.trim()
+    if (input.categoryId !== undefined) {
+      const category = this.categories.find((c) => c.id === input.categoryId)
+      if (!category) throw new Error('category not found')
+      project.categoryId = input.categoryId
+      project.categoryName = category.name
+    }
+    if (input.description !== undefined) project.description = input.description
+    if (input.status !== undefined) project.status = input.status
+    if (input.planStartDate !== undefined) project.planStartDate = input.planStartDate || null
+    if (input.dueDate !== undefined) project.dueDate = input.dueDate || null
+    project.updatedAt = Date.now()
+    return project
+  }
+
+  async getAllTaskProgress(): Promise<TaskProgress[]> {
+    this.takeFailure()
+    const map = new Map(this.tasks.map((t) => [t.id, {
+      taskId: t.id,
+      confirmedSeconds: 0,
+      provisionalSeconds: 0,
+      targetSeconds: t.targetSeconds,
+      progress: 0,
+      overSeconds: 0,
+    }]))
+    return [...map.values()]
+  }
+
+  async getTaskProgress(taskId: string): Promise<TaskProgress> {
+    this.takeFailure()
+    const task = this.tasks.find((t) => t.id === taskId)
+    if (!task) throw new Error(`task ${taskId} not found`)
+    return {
+      taskId,
+      confirmedSeconds: 0,
+      provisionalSeconds: 0,
+      targetSeconds: task.targetSeconds,
+      progress: 0,
+      overSeconds: 0,
+    }
+  }
+
+  async completeTaskNow(input: CompleteTaskInput): Promise<CompleteTaskResult> {
+    this.takeFailure()
+    const now = Date.now()
+    const task = this.tasks.find((t) => t.id === input.taskId)
+    if (!task) throw new Error('task not found')
+    if (task.done) {
+      return { task, timer: this.timer, segmentSavedMs: 0, newlyCompleted: false }
+    }
+    task.done = true
+    task.status = 'done'
+    task.completedAt = now
+    const focused = Math.max(0, this.timer.durationSeconds - this.timer.remainingSeconds)
+    this.timer = {
+      ...this.timer,
+      state: 'paused',
+      selectedTaskId: null,
+      taskTitleSnapshot: '未指定任务',
+      projectSnapshot: '通用',
+      targetEndAt: null,
+      pausedAt: now,
+      revision: this.timer.revision + 1,
+      updatedAt: now,
+    }
+    return { task: { ...task }, timer: this.timer, segmentSavedMs: focused * 1000, newlyCompleted: true }
+  }
   // --- Tray surface (no-op in tests, but recorded for assertions) ---
 
   /** Last indicator pushed by the App, useful for component-test assertions. */

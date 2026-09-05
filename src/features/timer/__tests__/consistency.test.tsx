@@ -23,7 +23,7 @@ async function createTask(gateway: FakeAppGateway, user: ReturnType<typeof userE
   await user.type(input, title)
   await user.keyboard('{Enter}')
   await screen.findByText(title)
-  await user.click(screen.getByRole('button', { name: '专注' }))
+  await user.click(screen.getByTitle('专注'))
 }
 
 describe('v1.1.2 stage B: task switching', () => {
@@ -50,11 +50,10 @@ describe('v1.1.2 stage B: task switching', () => {
     await waitFor(() => {
       expect(gateway.currentTimer.selectedTaskId).toBe(gateway.currentTasks.find(t => t.title === '任务 B')?.id)
     })
+    // v1.2: same-clock switch — no session is written mid-round; the ledger
+    // keeps A's effective time in a closed pending segment instead.
     const all = await gateway.listSessions({ scope: 'all' })
-    const closedA = all.find((s: TimerSession) => s.taskTitleSnapshot === '任务 A')
-    expect(closedA).toBeDefined()
-    expect(closedA?.status).toBe('completed')
-    expect(closedA?.finishReason).toBe('manual_finish')
+    expect(all.find((s: TimerSession) => s.taskTitleSnapshot === '任务 A')).toBeUndefined()
   })
 
   it('a short switch-closed session stays out of the activity view', async () => {

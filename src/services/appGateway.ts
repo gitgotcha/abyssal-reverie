@@ -1,5 +1,14 @@
 import type {
   AppSettings,
+  Category,
+  CreateCategoryInput,
+  UpdateCategoryInput,
+  Project,
+  CreateProjectInput,
+  UpdateProjectInput,
+  TaskProgress,
+  CompleteTaskInput,
+  CompleteTaskResult,
   BootstrapPayload,
   CompleteTimerInput,
   CompleteTimerResult,
@@ -46,6 +55,19 @@ export interface AppGateway {
   createTask(input: CreateTaskInput): Promise<Task>
   updateTask(input: UpdateTaskInput): Promise<Task>
   deleteTask(id: string): Promise<void>
+  // ─── Categories, projects & task ledger (v1.2) ────────────────────────────
+  listCategories(): Promise<Category[]>
+  createCategory(input: CreateCategoryInput): Promise<Category>
+  updateCategory(input: UpdateCategoryInput): Promise<Category>
+  listProjects(): Promise<Project[]>
+  createProject(input: CreateProjectInput): Promise<Project>
+  updateProject(input: UpdateProjectInput): Promise<Project>
+  /** Real-time progress for one task (confirmed + provisional segments). */
+  getTaskProgress(taskId: string): Promise<TaskProgress>
+  /** Batch variant — one call for list views. */
+  getAllTaskProgress(): Promise<TaskProgress[]>
+  /** v1.2 B4: atomic "pause + save segment + mark done + unbind". */
+  completeTaskNow(input: CompleteTaskInput): Promise<CompleteTaskResult>
   // ─── Tags (v1.1) ──────────────────────────────────────────────────────────
   listTags(): Promise<Tag[]>
   createTag(input: CreateTagInput): Promise<Tag>

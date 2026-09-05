@@ -29,6 +29,12 @@ function renderPanel(overrides: {
       pomodoroTarget: 1,
       priority: 'med',
       project: '通用',
+      projectId: null,
+      targetSeconds: 1500,
+      budgetSource: 'creation',
+      status: 'todo',
+      deadline: null,
+      notes: '',
       tagId: 'system-other',
       sortOrder: 0,
       createdAt: 0,
@@ -41,11 +47,17 @@ function renderPanel(overrides: {
   render(
     <TasksPanel
       tasks={[]}
+      categories={[]}
+      projects={[]}
+      progress={{}}
       tags={[fallbackTag]}
       onCreateTask={onCreateTask as unknown as (input: unknown) => Promise<unknown>}
       onToggleTask={vi.fn()}
-      onDeleteTask={vi.fn()}
       onCyclePriority={vi.fn()}
+      onArchiveTask={vi.fn(async () => undefined)}
+      onStartFocus={vi.fn()}
+      onCompleteTask={vi.fn(async () => undefined)}
+      onUpdateTask={vi.fn(async () => undefined)}
       onNotify={onNotify as unknown as (message: string) => void}
       tagOps={{
         createTag: vi.fn(),
@@ -53,6 +65,15 @@ function renderPanel(overrides: {
         reorderTag: vi.fn(),
         previewDeleteTag: vi.fn(async () => ({ tagId: 'x', affectedTasks: 0 })),
         deleteTag: vi.fn(),
+      }}
+      projectOps={{
+        createProject: vi.fn(),
+        renameProject: vi.fn(),
+        archiveProject: vi.fn(),
+        createCategory: vi.fn(),
+        renameCategory: vi.fn(),
+        archiveCategory: vi.fn(),
+        moveProject: vi.fn(),
       }}
     />,
   )

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Task, TimerMode, TimerSnapshot } from "../../domain/models";
+import type { Task, TaskProgress, TimerMode, TimerSnapshot } from "../../domain/models";
 import { DEFAULT_SETTINGS } from "../../domain/defaults";
 import { HorizonDivider } from "./GoalRing";
 import { C, CARD } from "../shared/palette";
@@ -8,9 +8,11 @@ import { playCompletionSound, notifyCompletion } from "../shared/notify";
 import { GoalRing } from "./GoalRing";
 import { TimerArc } from "./TimerArc";
 
-export function TimerPanel({ timer, tasks, selectedTaskId, onSelectTask, onStart, onPause, onResume, onReset, onResetRequest, onFinish, onSwitchMode, onExpire }: {
+export function TimerPanel({ timer, tasks, taskProgress, selectedTaskId, onSelectTask, onStart, onPause, onResume, onReset, onResetRequest, onFinish, onSwitchMode, onExpire }: {
   timer: TimerSnapshot | null;
   tasks: Task[];
+  /** v1.2 G1: per-task progress (confirmed + provisional), keyed by task id. */
+  taskProgress: Record<string, TaskProgress>;
   /** v1.1.2 B2: the current task is the backend's snapshot (or the pending
    *  idle selection owned by App) — never local highlight state. */
   selectedTaskId: string | null;
@@ -283,7 +285,40 @@ export function TimerPanel({ timer, tasks, selectedTaskId, onSelectTask, onStart
                           <circle cx="3" cy="3" r="2.4" fill={C.silver} className="breathe" />
                         </svg>
                       )}
-                      <span style={{ flex: 1, lineHeight: 1.4 }}>{task.title}</span>
+                      <span style={{
+                        flex: 1, lineHeight: 1.4, display: "flex", flexDirection: "column", gap: 3, minWidth: 0,
+                      }}>
+                        <span style={{
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}>{task.title}</span>
+                        {(() => {
+                          // v1.2 G1: real progress from the segment ledger —
+                          // 达预计 shows the explicit badge, extra time is listed.
+                          const prog = taskProgress[task.id];
+                          if (!prog || prog.targetSeconds <= 0) return null;
+                          const pct = Math.round(prog.progress * 100);
+                          const over = prog.overSeconds > 0;
+                          return (
+                            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{
+                                width: 64, height: 3, borderRadius: 2, overflow: "hidden",
+                                background: "rgba(215,228,230,0.10)", flexShrink: 0,
+                              }}>
+                                <span style={{
+                                  display: "block", height: "100%", width: `${Math.min(100, pct)}%`,
+                                  background: pct >= 100 ? "rgba(186,200,204,0.85)" : "rgba(158,173,178,0.55)",
+                                }} />
+                              </span>
+                              <span style={{
+                                fontFamily: "var(--font-sans)", fontSize: 9,
+                                color: over ? "rgba(186,200,204,0.85)" : C.textMuted,
+                              }}>
+                                {pct}%{over ? ` · 超出预计 ${Math.round(prog.overSeconds / 60)} 分钟` : pct >= 100 ? " · 已达预计" : ""}
+                              </span>
+                            </span>
+                          );
+                        })()}
+                      </span>
                       <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: C.textMuted, flexShrink: 0 }}>×{task.pomodoroTarget}</span>
                     </button>
                   );

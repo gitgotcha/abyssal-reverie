@@ -151,6 +151,12 @@ pub fn get_task_progress(state: State<'_, AppState>, task_id: String) -> Result<
 }
 
 #[tauri::command]
+pub fn get_all_task_progress(state: State<'_, AppState>) -> Result<Vec<crate::models::TaskProgress>, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::get_all_task_progress(&conn)
+}
+
+#[tauri::command]
 pub fn complete_task_now(state: State<'_, AppState>, input: crate::models::CompleteTaskInput) -> Result<crate::models::CompleteTaskResult, CommandError> {
     let mut conn = lock_db(&state)?;
     repository::complete_task_now(&mut conn, &input)

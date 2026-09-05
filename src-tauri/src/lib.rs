@@ -180,6 +180,7 @@ pub fn run() {
             commands::create_project,
             commands::update_project,
             commands::get_task_progress,
+            commands::get_all_task_progress,
             commands::complete_task_now,
             commands::finish_timer,
             commands::list_sessions,

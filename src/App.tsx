@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { AppSettings, CreateTaskInput, ImportPreview, Statistics, Tag, Task, TaskPriority, TimerMode, TimerSession, TimerSnapshot } from "./domain/models";
+import type {
+  AppSettings, Category, CompleteTaskInput, CreateTaskInput, ImportPreview, Project, Statistics,
+  Tag, Task, TaskPriority, TaskProgress, TimerMode, TimerSession, TimerSnapshot, UpdateTaskInput,
+} from "./domain/models";
 import { DEFAULT_SETTINGS, durationSecondsForMode } from "./domain/defaults";
 import { todayBoundary, weekBoundaries, weekRange } from "./domain/statistics";
 import { formatTrayIndicator } from "./domain/tray";
@@ -210,6 +213,9 @@ export default function App() {
   const [nav, setNav]     = useState<NavSection>("timer");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [progress, setProgress] = useState<Record<string, TaskProgress>>({});
   const [logs, setLogs]   = useState<SessionLog[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [weekStats, setWeekStats] = useState<Statistics | null>(null);
@@ -251,6 +257,15 @@ export default function App() {
       })
       .catch(() => undefined);
   }, [gateway, applyTimer]);
+
+  // v1.2: categories/projects power the forms; progress feeds rows & selector.
+  const refreshTaskData = useCallback(() => {
+    gateway.listCategories().then(setCategories).catch(() => undefined);
+    gateway.listProjects().then(setProjects).catch(() => undefined);
+    gateway.getAllTaskProgress().then(list => {
+      setProgress(Object.fromEntries(list.map(p => [p.taskId, p])));
+    }).catch(() => undefined);
+  }, [gateway]);
 
   const refreshStats = useCallback(() => {
     const { from, to } = weekRange();
@@ -452,6 +467,19 @@ export default function App() {
     return () => clearInterval(id);
   }, [timer, gateway]);
 
+  // v1.2 G1: live task progress while a round is active.
+  useEffect(() => {
+    if (timer?.state !== "running" && timer?.state !== "paused") return;
+    const pull = () => {
+      gateway.getAllTaskProgress().then(list => {
+        setProgress(Object.fromEntries(list.map(p => [p.taskId, p])));
+      }).catch(() => undefined);
+    };
+    pull();
+    const id = setInterval(pull, 5000);
+    return () => clearInterval(id);
+  }, [timer?.state, gateway]);
+
   // Rust completion backstop → reuse the same idempotent `handleExpire` path.
   useEffect(() => {
     return gateway.subscribeTimerExpired(() => handleExpire());
@@ -493,6 +521,7 @@ export default function App() {
         setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
         setSettings(payload.settings);
         applyTimer(payload.timer);
+        refreshTaskData();
         const t = payload.timer;
         if (t.state === "running" && t.activeSessionId && t.targetEndAt && Date.now() >= t.targetEndAt) {
           await runComplete(t, true).catch(resync);
@@ -501,7 +530,7 @@ export default function App() {
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
-  }, [gateway, applyTimer, runComplete, resync, refreshStats]);
+  }, [gateway, applyTimer, runComplete, resync, refreshStats, refreshTaskData]);
 
   const saveSettings = useCallback(async (next: AppSettings) => {
     const result = await gateway.saveSettings(next);
@@ -513,7 +542,44 @@ export default function App() {
   const createTask = useCallback(async (input: CreateTaskInput) => {
     const task = await gateway.createTask(input);
     setTasks(p => [...p, task]);
-  }, [gateway]);
+    refreshTaskData();
+  }, [gateway, refreshTaskData]);
+
+  const updateTaskOp = useCallback(async (input: UpdateTaskInput) => {
+    const updated = await gateway.updateTask(input);
+    setTasks(p => p.map(t => (t.id === updated.id ? updated : t)));
+    refreshTaskData();
+    return updated;
+  }, [gateway, refreshTaskData]);
+
+  // v1.2 D-7: archive instead of delete — history stays traceable.
+  const archiveTask = useCallback(async (id: string, archived: boolean) => {
+    const current = tasks.find(t => t.id === id);
+    await updateTaskOp({ id, archived });
+    if (archived) setToast("任务已归档，可在全部筛选中恢复");
+    else setToast(`已恢复「${current?.title ?? "任务"}」`);
+  }, [tasks, updateTaskOp]);
+
+  // v1.2 B4: complete the CURRENT task atomically (pause + save + unbind).
+  const completeTaskOp = useCallback(async (taskId: string) => {
+    const cur = timerRef.current;
+    if (!cur || !cur.activeSessionId) throw new Error("当前没有进行中的专注");
+    if (cur.selectedTaskId !== taskId) throw new Error("该任务不是当前专注任务，请在任务详情中标记完成");
+    const input: CompleteTaskInput = {
+      taskId,
+      expectedRevision: cur.revision,
+      activeSessionId: cur.activeSessionId,
+    };
+    const result = await gateway.completeTaskNow(input);
+    applyTimer(result.timer);
+    refreshTaskData();
+    if (result.newlyCompleted) {
+      const minutes = Math.round(result.segmentSavedMs / 60000);
+      setToast(`任务已完成，已保存 ${minutes} 分钟；主钟保持暂停`);
+    } else {
+      setToast("任务已完成");
+    }
+  }, [gateway, applyTimer, refreshTaskData]);
 
   // ─── Tag operations (v1.1) ─────────────────────────────────────────────────
   const createTagOp = useCallback(async (name: string) => {
@@ -568,6 +634,7 @@ export default function App() {
         <TimerPanel
           timer={timer}
           tasks={tasks}
+          taskProgress={progress}
           selectedTaskId={selectorTaskId}
           onSelectTask={handleSelectTask}
           onStart={handleStart}
@@ -584,10 +651,16 @@ export default function App() {
         <TasksPanel
           tasks={tasks}
           tags={tags}
+          categories={categories}
+          projects={projects}
+          progress={progress}
           onCreateTask={createTask}
           onToggleTask={toggleTask}
-          onDeleteTask={deleteTask}
+          onArchiveTask={archiveTask}
+          onStartFocus={taskId => handleSelectTask(taskId)}
+          onCompleteTask={completeTaskOp}
           onCyclePriority={cyclePriority}
+          onUpdateTask={updateTaskOp}
           onNotify={setToast}
           tagOps={{
             createTag: createTagOp,
@@ -595,6 +668,43 @@ export default function App() {
             reorderTag: reorderTagOp,
             previewDeleteTag: id => gateway.previewDeleteTag(id),
             deleteTag: removeTag,
+          }}
+          projectOps={{
+            createProject: async (name, categoryId) => {
+              const project = await gateway.createProject({ name, categoryId });
+              refreshTaskData();
+              return project;
+            },
+            renameProject: async (id, name) => {
+              const project = await gateway.updateProject({ id, name });
+              refreshTaskData();
+              return project;
+            },
+            archiveProject: async (id, archived) => {
+              const project = await gateway.updateProject({ id, status: archived ? "archived" : "active" });
+              refreshTaskData();
+              return project;
+            },
+            createCategory: async name => {
+              const category = await gateway.createCategory({ name });
+              refreshTaskData();
+              return category;
+            },
+            renameCategory: async (id, name) => {
+              const category = await gateway.updateCategory({ id, name });
+              refreshTaskData();
+              return category;
+            },
+            archiveCategory: async (id, archived) => {
+              const category = await gateway.updateCategory({ id, archived });
+              refreshTaskData();
+              return category;
+            },
+            moveProject: async (id, categoryId) => {
+              const project = await gateway.updateProject({ id, categoryId });
+              refreshTaskData();
+              return project;
+            },
           }}
         />
       );
