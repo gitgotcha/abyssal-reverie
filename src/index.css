@@ -396,3 +396,26 @@ body {
   }
   * { transition-duration: 0.01ms !important; }
 }
+
+/* v1.3 D: ocean companion animations (mini window). Respect reduced motion. */
+@keyframes mini-fish-swim {
+  0%   { transform: scaleX(-1) translate(0, 0); }
+  25%  { transform: scaleX(-1) translate(3px, -2px); }
+  50%  { transform: scaleX(-1) translate(0, 1px); }
+  75%  { transform: scaleX(-1) translate(-3px, -1px); }
+  100% { transform: scaleX(-1) translate(0, 0); }
+}
+@keyframes mini-fish-rest {
+  0%, 100% { transform: scaleX(-1) translate(0, 0); opacity: 0.7; }
+  50%      { transform: scaleX(-1) translate(0, -1px); opacity: 0.9; }
+}
+@keyframes mini-fish-celebrate {
+  0%   { transform: scaleX(-1) translate(0, 0) rotate(0deg); }
+  25%  { transform: scaleX(-1) translate(0, -4px) rotate(-8deg); }
+  50%  { transform: scaleX(-1) translate(0, 0) rotate(0deg); }
+  75%  { transform: scaleX(-1) translate(0, -3px) rotate(8deg); }
+  100% { transform: scaleX(-1) translate(0, 0) rotate(0deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mini-fish, [style*="mini-fish"] { animation: none !important; }
+}

@@ -1364,6 +1364,26 @@ pub fn get_task_progress(conn: &Connection, task_id: &str) -> Result<TaskProgres
 /// v1.2 B4: complete the current task NOW — close the open segment, confirm
 /// the ledger once the session qualifies, mark the task done, unbind it and
 /// keep the main clock PAUSED with its remaining time. Atomic + idempotent.
+/// v1.3 C4: undo a task completion. The task returns to `todo` with its real
+/// invested segments preserved (they are genuine records, not completion
+/// padding); the main clock stays paused — the user chooses what is next.
+pub fn undo_complete_task(conn: &Connection, task_id: &str) -> Result<Task, CommandError> {
+    let mut task = get_task(conn, task_id)?;
+    if !task.done {
+        return Err(CommandError::validation("task is not completed"));
+    }
+    let now = now_millis();
+    task.done = false;
+    task.status = "todo".to_owned();
+    task.completed_at = None;
+    task.updated_at = now;
+    conn.execute(
+        "UPDATE tasks SET done = 0, status = 'todo', completed_at = NULL, updated_at = ?1 WHERE id = ?2",
+        params![now, task.id],
+    )?;
+    Ok(task)
+}
+
 /// v1.3 A1: the authoritative settlement path, driven by the background
 /// ticker so an unresponsive/hidden frontend can never delay settlement.
 /// Reuses `complete_timer` (idempotent): whichever entry settles first wins,

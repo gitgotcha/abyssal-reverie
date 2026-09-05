@@ -2,6 +2,7 @@ import { DEFAULT_SETTINGS, durationSecondsForMode, idleTimerForMode } from '../d
 import type { AppGateway } from '../services/appGateway'
 import type {
   AppSettings,
+  MiniWindowPrefs,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -769,6 +770,31 @@ export class FakeAppGateway implements AppGateway {
     }
     return { task: { ...task }, timer: this.timer, segmentSavedMs: focused * 1000, newlyCompleted: true }
   }
+  // ─── Mini window (v1.3 B/C, in-memory stubs) ────────────────────────────────
+
+  miniPrefs: MiniWindowPrefs = { x: null, y: null, alwaysOnTop: true, collapsed: false }
+
+  async showMainWindow(): Promise<void> { this.takeFailure() }
+  async toggleMiniWindow(): Promise<void> { this.takeFailure() }
+  async loadMiniPrefs(): Promise<MiniWindowPrefs> {
+    this.takeFailure()
+    return this.miniPrefs
+  }
+  async saveMiniPrefs(prefs: MiniWindowPrefs): Promise<void> {
+    this.takeFailure()
+    this.miniPrefs = prefs
+  }
+  async undoCompleteTask(taskId: string): Promise<Task> {
+    this.takeFailure()
+    const task = this.tasks.find((t) => t.id === taskId)
+    if (!task) throw new Error(`task ${taskId} not found`)
+    if (!task.done) throw new Error('task is not completed')
+    task.done = false
+    task.status = 'todo'
+    task.completedAt = null
+    return { ...task }
+  }
+
   // --- Tray surface (no-op in tests, but recorded for assertions) ---
 
   /** Last indicator pushed by the App, useful for component-test assertions. */

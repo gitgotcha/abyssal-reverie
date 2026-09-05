@@ -10,6 +10,7 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod models;
+pub mod prefs;
 pub mod repository;
 pub mod tray;
 
@@ -110,6 +111,11 @@ pub fn run() {
 
             tray::build_tray(app.handle())?;
 
+            // v1.3 B3: restore the mini window's saved position/always-on-top
+            // (clamped into the visible area). It stays hidden until shown.
+            let device_settings = prefs::load_device_settings(app.handle());
+            prefs::apply_mini_prefs(app.handle(), &device_settings.mini);
+
             // Register the global hotkey at runtime (not in the plugin builder)
             // so a conflict with another application degrades gracefully instead
             // of crashing the app at launch. The builder's global handler above
@@ -182,6 +188,11 @@ pub fn run() {
             commands::get_task_progress,
             commands::get_all_task_progress,
             commands::complete_task_now,
+            commands::show_main_window,
+            commands::toggle_mini_window,
+            commands::load_mini_prefs,
+            commands::save_mini_prefs,
+            commands::undo_complete_task,
             commands::finish_timer,
             commands::list_sessions,
             commands::get_statistics,

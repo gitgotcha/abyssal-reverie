@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mini",
+  "description": "Minimal permissions for the mini window (v1.3 B1)",
+  "windows": ["mini"],
+  "permissions": ["core:default"]
+}

@@ -2,6 +2,24 @@
 
 ---
 
+## v1.3.0 悬浮小窗与海洋伙伴回归（2026-09-06，分支 feature/v1.3-mini-window）
+
+依据 `docs/plans/V1.3_MINI_WINDOW_PLAN.md` 执行阶段 A–E（夜间自主执行）。
+
+| 阶段 | 交付 | 验证 |
+|---|---|---|
+| A 后台结算 | ticker 直接落库 + timer-settled/timer-changed 广播 | ticker_settles_expired_without_frontend_and_is_single_shot（无前端时结算一次） |
+| B 小窗基建 | mini 窗口（独立、非 owned）+ mini capability（最小权限）+ device-settings.json 位置记忆 + 托盘切换 | cargo build；实机矩阵待验收 |
+| C 小窗 UI | 倒计时/暂停/完成任务并保存/撤销（8s）/折叠/置顶/返回主窗 | 命令幂等沿用 complete_task_now 测试；UI 由实机验收 |
+| D 海洋伙伴 | Fish Pack（CC0）入库 + 状态动画 + 纯数字模式 | 资产哈希登记 SHA256SUMS + THIRD_PARTY_NOTICES |
+| E 版本 | 1.3.0 + 文档 | — |
+
+### 门禁结果
+- `cargo test`：**110 passed**、0 failed
+- `pnpm verify`：vitest 45 passed、tsc 0
+- `vite build` 双入口（main + mini）✓；tauri build 实机待验收
+
+---
 ## v1.2.0 类别·项目·任务与计时升级回归（2026-09-06，分支 feature/v1.2-tasks-projects）
 
 依据 `docs/plans/V1.2_TASKS_PROJECTS_PLAN.md` 执行阶段 A–H（G2/G3 排版与字体按用户指示挂起）。

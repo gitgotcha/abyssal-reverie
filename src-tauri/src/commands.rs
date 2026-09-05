@@ -4,6 +4,7 @@ use std::sync::MutexGuard;
 use rusqlite::Connection;
 use tauri::Emitter;
 use tauri::AppHandle;
+use tauri::Manager;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
@@ -163,6 +164,61 @@ pub fn complete_task_now(app: tauri::AppHandle, state: State<'_, AppState>, inpu
     let result = repository::complete_task_now(&mut conn, &input)?;
     let _ = app.emit("timer-changed", &result.timer);
     Ok(result)
+}
+
+// ─── Mini window (v1.3 B/C) ──────────────────────────────────────────────────
+
+/// Shows + focuses the main window (used by the mini window's 返回主窗 button).
+#[tauri::command]
+pub fn show_main_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Toggles the mini window's visibility (tray menu + mini close button).
+#[tauri::command]
+pub fn toggle_mini_window(app: tauri::AppHandle) {
+    if let Some(mini) = app.get_webview_window("mini") {
+        if mini.is_visible().unwrap_or(false) {
+            let _ = mini.hide();
+        } else {
+            let _ = mini.show();
+        }
+    }
+}
+
+/// Loads the mini window's device-local prefs.
+#[tauri::command]
+pub fn load_mini_prefs(app: tauri::AppHandle) -> crate::prefs::MiniWindowPrefs {
+    crate::prefs::load_device_settings(&app).mini
+}
+
+/// Persists the mini window's device-local prefs and applies them live.
+#[tauri::command]
+pub fn save_mini_prefs(
+    app: tauri::AppHandle,
+    prefs: crate::prefs::MiniWindowPrefs,
+) -> Result<(), CommandError> {
+    let mut settings = crate::prefs::load_device_settings(&app);
+    settings.mini = prefs.clone();
+    crate::prefs::save_device_settings(&app, &settings)
+        .map_err(|e| CommandError::internal(format!("保存窗口偏好失败: {e}")))?;
+    crate::prefs::apply_mini_prefs(&app, &prefs);
+    Ok(())
+}
+
+/// v1.3 C4: undo a task completion — the task returns to todo while its real
+/// recorded segments stay; the main clock remains paused.
+#[tauri::command]
+pub fn undo_complete_task(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<crate::models::Task, CommandError> {
+    let conn = lock_db(&state)?;
+    repository::undo_complete_task(&conn, &task_id)
 }
 
 #[tauri::command]

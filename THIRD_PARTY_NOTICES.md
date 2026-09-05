@@ -41,3 +41,11 @@
 - 说明：本项目选择 CC0 许可路径；如对再分发政策有更高要求，应在公开发布前保留作者归属说明。
 
 > 运行时不依赖上述网络地址；这些地址仅用于来源追溯和许可证记录。
+
+## Kenney Fish Pack 2.0（v1.3 海洋伙伴）
+
+- 来源：Kenney · Fish Pack 2.0（https://kenney.nl/assets/fish-pack）
+- 实际本地文件：`public/media/fish/`（fish_blue / fish_green / fish_grey / background_seaweed_a / background_rock_a）
+- 源副本与许可：`assets/fish/`（含 LICENSE.txt 与 SHA256SUMS.txt）
+- 下载日期：2026-09-06
+- 许可：Creative Commons Zero (CC0 1.0)，可自由使用；以标注 Kenney 来源表示感谢（非强制）

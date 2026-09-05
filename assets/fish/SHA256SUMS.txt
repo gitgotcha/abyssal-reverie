@@ -1,0 +1,5 @@
+0c114b3404980e9672f556007720ca594fc8a855821cdaaa0b92ca0643f49074  *assets/fish/background_rock_a.png
+639e2ad0af94f0bd321d3371a2bddd4e25608c8f31696ecbece6ff2b5bc38a45  *assets/fish/background_seaweed_a.png
+f9433936c149c53eeb8c82117a41011e800b3b4c1b72dc682e156f8b29cd2286  *assets/fish/fish_blue.png
+9ea252d22a0b4f2b21e0a40a7a4732894c03b617e2f48d18318ac73559c392b6  *assets/fish/fish_green.png
+53ca792f3ce36cda5b276461ab8eebe5b1c1674bddcbff91f6a96f6ab01902b7  *assets/fish/fish_grey.png

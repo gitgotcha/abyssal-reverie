@@ -20,6 +20,7 @@ const ID_STATUS: &str = "tray_status";
 const ID_TOGGLE: &str = "tray_toggle";
 const ID_RESET: &str = "tray_reset";
 const ID_SHOW: &str = "tray_show";
+const ID_TOGGLE_MINI: &str = "tray_toggle_mini";
 const ID_QUIT: &str = "tray_quit";
 
 /// Tray action broadcast to the frontend so it can reuse its existing
@@ -55,12 +56,13 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, ID_TOGGLE, "开始专注", true, None::<&str>)?;
     let reset = MenuItem::with_id(app, ID_RESET, "结束本次", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
-    let show = MenuItem::with_id(app, ID_SHOW, "显示窗口", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, ID_SHOW, "显示主窗口", true, None::<&str>)?;
+    let toggle_mini = MenuItem::with_id(app, ID_TOGGLE_MINI, "显示/隐藏小窗", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "退出 Abyssal Reverie", true, None::<&str>)?;
 
     let menu = Menu::with_items(
         app,
-        &[&status, &toggle, &reset, &sep1, &show, &quit],
+        &[&status, &toggle, &reset, &sep1, &show, &toggle_mini, &quit],
     )?;
 
     let icon = tauri::include_image!("icons/32x32.png");
@@ -130,6 +132,16 @@ fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         ID_SHOW => {
             show_main_window(app);
+        }
+        ID_TOGGLE_MINI => {
+            // v1.3 B5: show/hide the mini window directly in Rust.
+            if let Some(mini) = app.get_webview_window("mini") {
+                if mini.is_visible().unwrap_or(false) {
+                    let _ = mini.hide();
+                } else {
+                    let _ = mini.show();
+                }
+            }
         }
         ID_QUIT => {
             // User rule: if a focus session is running, freeze it as paused

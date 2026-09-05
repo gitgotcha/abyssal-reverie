@@ -1,5 +1,6 @@
 import type {
   AppSettings,
+  MiniWindowPrefs,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -86,6 +87,15 @@ export interface AppGateway {
   subscribeTimerSettled(cb: (payload: { timer: TimerSnapshot; session: TimerSession; newlyCompleted: boolean }) => void): () => void
   /** v1.3 A4: snapshot broadcast to every window after a timer change. */
   subscribeTimerChanged(cb: (snapshot: TimerSnapshot) => void): () => void
+  // ─── Mini window (v1.3 B/C) ─────────────────────────────────────────────────
+  /** Shows + focuses the main window (小窗「返回主窗」). */
+  showMainWindow(): Promise<void>
+  /** Toggles the mini window's visibility (小窗「关闭」= hide; 计时继续). */
+  toggleMiniWindow(): Promise<void>
+  loadMiniPrefs(): Promise<MiniWindowPrefs>
+  saveMiniPrefs(prefs: MiniWindowPrefs): Promise<void>
+  /** v1.3 C4: undo a task completion; real recorded segments stay. */
+  undoCompleteTask(taskId: string): Promise<Task>
   /** Subscribes to tray menu actions (pause/resume, reset). Returns an unsubscribe. */
   subscribeTrayAction(cb: (action: TrayAction) => void): () => void
   /** Subscribes to the global-shortcut conflict warning (hotkey taken by another

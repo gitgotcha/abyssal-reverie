@@ -276,6 +276,14 @@ export interface CompleteTaskResult {
   newlyCompleted: boolean
 }
 
+/** v1.3 B3: device-local mini window prefs (never synced). */
+export interface MiniWindowPrefs {
+  x?: number | null
+  y?: number | null
+  alwaysOnTop: boolean
+  collapsed: boolean
+}
+
 export interface TimerRevisionInput {
   expectedRevision: number
 }

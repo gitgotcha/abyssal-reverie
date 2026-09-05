@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { AppGateway } from './appGateway'
 import type {
   AppSettings,
+  MiniWindowPrefs,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -76,6 +77,13 @@ export class TauriAppGateway implements AppGateway {
   reorderTag(input: ReorderTagInput) { return invoke<Tag[]>('reorder_tag', { input }) }
   previewDeleteTag(id: string) { return invoke<TagDeletePreview>('preview_delete_tag', { id }) }
   deleteTag(id: string) { return invoke<DeleteTagResult>('delete_tag', { id }) }
+
+  // ─── Mini window (v1.3 B/C) ─────────────────────────────────────────────────
+  showMainWindow() { return invoke<void>('show_main_window') }
+  toggleMiniWindow() { return invoke<void>('toggle_mini_window') }
+  loadMiniPrefs() { return invoke<MiniWindowPrefs>('load_mini_prefs') }
+  saveMiniPrefs(prefs: MiniWindowPrefs) { return invoke<void>('save_mini_prefs', { prefs }) }
+  undoCompleteTask(taskId: string) { return invoke<Task>('undo_complete_task', { taskId }) }
 
   saveSettings(input: AppSettings) { return invoke<SaveSettingsResult>('save_settings', { input }) }
   listSessions(query: SessionQuery) { return invoke<TimerSession[]>('list_sessions', { query }) }
