@@ -1798,6 +1798,117 @@ mod tests {
         );
         eprintln!("[drill] upgraded copy preserved at {} for inspection", dir.display());
     }
+
+    /// v1.3.0 acceptance drill: a COPY of the real v1.1.1 database (schema v3,
+    /// preserved in release/v1.3.0/rehearsal/live-backup/) goes through the
+    /// R06 flow — read-only preview, user-parameter migration, reconciliation,
+    /// and the cancel path. The LIVE database is never touched: the user
+    /// confirmed the real v3→v4 migration on 2026-09-06, so the live file is
+    /// already v4 and this drill must stay reproducible regardless of it.
+    #[test]
+    #[ignore = "v1.3.0 drill: upgrades a COPY of the real v1.1.1 snapshot; run with cargo test drill_real_v3 -- --ignored --nocapture"]
+    fn drill_real_v3_to_v4_with_preview_and_reconcile() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../release/v1.3.0/rehearsal/live-backup")
+            .join("abyssal-reverie.sqlite");
+        assert!(
+            source.exists(),
+            "rehearsal v3 snapshot not found at {} — restore release/v1.3.0/rehearsal/live-backup/ (sqlite + -wal + -shm) first",
+            source.display()
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-drill-v4-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        for ext in ["", "-wal", "-shm"] {
+            let from = std::path::PathBuf::from(format!("{}{ext}", source.display()));
+            if from.exists() {
+                std::fs::copy(&from, dir.join(format!("abyssal-reverie.sqlite{ext}")))
+                    .expect("copy must succeed");
+            }
+        }
+        let copy_path = dir.join("abyssal-reverie.sqlite");
+
+        // 0) Pre-state on the copy.
+        {
+            let pre = Connection::open(&copy_path).expect("pre-open");
+            let v = schema_version(&pre).expect("version");
+            eprintln!("[drill] source schema_version = {v}");
+            assert_eq!(v, 3, "the rehearsal snapshot must be schema v3");
+        }
+
+        // 1) CANCEL path: open_prepared does NOT migrate; data stays v3.
+        {
+            let mut prep = open_prepared(&copy_path).expect("prep open");
+            assert_eq!(schema_version(&prep).unwrap(), 3, "prep mode must not migrate");
+            let preview = preview_v4_migration(&prep).expect("preview");
+            eprintln!(
+                "[drill] preview: tasks={} sessions={} projects_to_create={:?} general_tasks={} suggested_basis={}min",
+                preview.task_count, preview.session_count,
+                preview.projects_to_create, preview.general_task_count,
+                preview.suggested_focus_minutes,
+            );
+            assert_eq!(schema_version(&prep).unwrap(), 3, "preview is read-only");
+            let pre_tasks: i64 = prep.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+            let pre_sessions: i64 = prep.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+            prep.pragma_update(None, "journal_mode", "DELETE").ok(); // flush copy state
+            drop(prep);
+            eprintln!("[drill] cancel path OK — schema still v3, data intact (tasks={pre_tasks}, sessions={pre_sessions})");
+        }
+
+        // 2) CONFIRM path with the preview's suggested basis, standalone 通用.
+        let params = crate::models::MigrationParams {
+            budget_focus_minutes: 0, // 0 = read the basis from the snapshot's settings (real user data)
+            general_mapping: "standalone".to_owned(),
+        };
+        {
+            let mut conn = open_prepared(&copy_path).expect("reopen for migration");
+            run_migrations_with(&mut conn, &params).expect("confirmed migration");
+            seed_defaults(&conn).expect("seed");
+            assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+
+            // 3) Reconciliation.
+            let tasks: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+            let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+            let eligible_sessions: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE statistics_eligible = 1 AND focused_seconds > 0",
+                [], |r| r.get(0)).unwrap();
+            let segments: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM focus_segments WHERE state = 'confirmed' AND temporal_precision = 'legacy_total_only'",
+                [], |r| r.get(0)).unwrap();
+            let session_seconds: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(focused_seconds),0) FROM sessions WHERE statistics_eligible = 1 AND focused_seconds > 0",
+                [], |r| r.get(0)).unwrap();
+            let segment_ms: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(effective_ms),0) FROM focus_segments WHERE state = 'confirmed' AND temporal_precision = 'legacy_total_only'",
+                [], |r| r.get(0)).unwrap();
+            let projects: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+            let budgets: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM budget_history WHERE source = 'migration'", [], |r| r.get(0)).unwrap();
+            let unmapped: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM focus_segments WHERE project_id_snapshot IS NULL", [], |r| r.get(0)).unwrap();
+            let fk_violations: usize = conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count();
+
+            eprintln!("[drill] post-migration: tasks={tasks} sessions={sessions} projects={projects} legacy_segments={segments} unmapped={unmapped} budget_rows={budgets} fk_violations={fk_violations}");
+            eprintln!("[drill] reconcile: session_seconds={session_seconds}s segment_ms={segment_ms}ms");
+            assert_eq!(segments, eligible_sessions, "every eligible session gets exactly one legacy record");
+            assert_eq!(segment_ms, session_seconds * 1000, "×1000 unit conversion must be exact");
+            assert_eq!(fk_violations, 0, "foreign_key_check must be clean");
+            assert_eq!(budgets, tasks, "each migrated task gets exactly one 'migration' budget_history row");
+        }
+
+        eprintln!("[drill] upgraded copy preserved at {} for inspection", dir.display());
+    }
 }
 
 /// Reads `user_version` from a THROWAWAY COPY of the {db, -wal, -shm} set so
