@@ -19,6 +19,23 @@
 - `pnpm verify`：vitest 45 passed、tsc 0
 - `vite build` 双入口（main + mini）✓；tauri build 实机待验收
 
+### 2026-09-06 增补（WorkBuddy 接手轮）：门禁复跑 + 真实库迁移事件
+
+**门禁复跑**（基线 `6a09c94` + 交接文档提交 `392dc17`）：
+- `cargo test --locked`：**113 passed / 0 failed / 2 ignored**（ignored = drill_real_v2 历史演练 + drill_real_v3 真实快照演练）
+- `cargo test drill_real_v3 -- --ignored --nocapture`：**ok** —— 取消路径 schema 保持 v3；确认路径迁移成功；对账 session_seconds=246s ↔ segment_ms=246000ms 精确 ×1000
+- `pnpm verify`：tsc 0 错误、vitest **45 passed**、vite build ✓
+
+**真实库 v3→v4 迁移（用户实机完成，2026-09-06 16:48:02）**：
+- 用户启动应用并在迁移预览屏点「确认升级」（本人操作，经裁定确认）；预迁移备份 `abyssal-reverie.sqlite.pre-v4-1788684482.bak` 先行落盘
+- 只读副本探针对账：integrity ok；合格会话 4 条 / 专注总量 246s；legacy 片段 4 条 / 246000ms（精确 ×1000）；migration 预算行 0（0 任务 → 每任务恰一行语义正确）
+- **用户裁定：真实库保留 v4；A1/A2 视为已实机完成；剩余实机矩阵 A3–A11**
+- 回滚点：`release/v1.3.0/rehearsal/live-backup/`（v3 三件套快照）+ `%APPDATA%` 内 pre-v4 备份
+
+**发布产物核验**：`sha256sum -c SHA256SUMS.txt` 双双 OK（portable 21,244,416 B / setup 273,748,219 B，12:09 构建；此后仅测试代码与文档变更，不进入发布二进制）
+
+**剩余待办**：A3–A11 实机矩阵（用户执行，见 HANDOFF_WORKBUDDY §3.1）→ `cargo fmt` 独立提交（合并前）→ 合并三分支 → 打 tag → 发版（需当次会话授权）
+
 ---
 ## v1.2.0 类别·项目·任务与计时升级回归（2026-09-06，分支 feature/v1.2-tasks-projects）
 
