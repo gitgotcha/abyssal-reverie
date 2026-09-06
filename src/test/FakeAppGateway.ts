@@ -3,6 +3,8 @@ import type { AppGateway } from '../services/appGateway'
 import type {
   AppSettings,
   MiniWindowPrefs,
+  MigrationPreview,
+  MigrationParams,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -773,6 +775,28 @@ export class FakeAppGateway implements AppGateway {
   // ─── Mini window (v1.3 B/C, in-memory stubs) ────────────────────────────────
 
   miniPrefs: MiniWindowPrefs = { x: null, y: null, alwaysOnTop: true, collapsed: false }
+
+  migrationPending = false
+
+  async previewMigration(): Promise<MigrationPreview> {
+    this.takeFailure()
+    return {
+      schemaVersion: 3,
+      taskCount: this.tasks.length,
+      sessionCount: this.sessions.length,
+      projectsToCreate: [],
+      generalTaskCount: 0,
+      suggestedFocusMinutes: this.settings.focusDurationMinutes,
+    }
+  }
+
+  async confirmMigration(_params: MigrationParams): Promise<BootstrapPayload> {
+    this.takeFailure()
+    this.migrationPending = false
+    return this.bootstrap()
+  }
+
+  async cancelUpgrade(): Promise<void> { this.takeFailure() }
 
   async showMainWindow(): Promise<void> { this.takeFailure() }
   async toggleMiniWindow(): Promise<void> { this.takeFailure() }

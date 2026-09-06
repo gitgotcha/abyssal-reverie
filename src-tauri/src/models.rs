@@ -557,6 +557,35 @@ pub struct UpdateProjectInput {
     pub due_date: Option<String>,
 }
 
+/// R06: read-only preview for a pending v3 → v4 semantic migration.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationPreview {
+    pub schema_version: u32,
+    pub task_count: i64,
+    pub session_count: i64,
+    /// Distinct trimmed legacy project names (excluding 通用/blank) that will
+    /// become real projects.
+    pub projects_to_create: Vec<String>,
+    /// Tasks in the legacy default project 通用 — their mapping is a choice.
+    pub general_task_count: i64,
+    /// The user's current focus duration — the SUGGESTED budget basis, never
+    /// an authority the user cannot override.
+    pub suggested_focus_minutes: i64,
+}
+
+/// R06: the user's confirmed migration decisions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationParams {
+    /// Minutes per pomodoro used to estimate legacy budgets (marked as
+    /// 'migration' source — never presented as exact history).
+    pub budget_focus_minutes: i64,
+    /// "standalone" (default): 通用 tasks become independent.
+    /// "project": 通用 becomes one real project in the fallback category.
+    pub general_mapping: String,
+}
+
 /// v1.2: real-time task progress (confirmed ledger + provisional segment).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

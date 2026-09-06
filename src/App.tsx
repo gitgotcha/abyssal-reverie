@@ -20,6 +20,7 @@ import { StatsPanel, StatsPage } from "./features/stats/StatsPanel";
 import { MiniBar } from "./features/shared/MiniBar";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ToastHost } from "./components/ToastHost";
+import { MigrationPrepScreen } from "./components/MigrationPrepScreen";
 
 const NAV_ITEMS: { id: NavSection; label: string; icon: React.JSX.Element }[] = [
   { id: "timer",    label: "专注",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6"/><path d="M12 7v5l3 3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
@@ -227,6 +228,8 @@ export default function App() {
   // v1.1.2 B2/B3: pending idle selection + the running-switch confirm dialog.
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState<{ taskId: string; title: string } | null>(null);
+  // R06: an old-schema database holds the app in migration-prep mode.
+  const [migrationPending, setMigrationPending] = useState(false);
 
   // Ref mirrors so async callbacks always see the latest snapshot without
   // becoming stale closures.
@@ -238,10 +241,39 @@ export default function App() {
   const activeSettings = settings ?? DEFAULT_SETTINGS;
   const durations = useCallback((mode: TimerMode) => durationSecondsForMode(mode, activeSettings), [activeSettings]);
 
+  // R02 (P112-04 #4): a returned running snapshot is applied only when its
+  // revision is not behind the current one — a late response must never roll
+  // back a round that has already moved on. Forced application (bootstrap,
+  // resync, backend broadcasts) goes through applyTimerForced.
   const applyTimer = useCallback((snapshot: TimerSnapshot) => {
+    const current = timerRef.current;
+    if (current && snapshot.revision < current.revision) {
+      return;
+    }
     timerRef.current = snapshot;
     setTimer(snapshot);
   }, []);
+
+  const applyTimerForced = useCallback((snapshot: TimerSnapshot) => {
+    timerRef.current = snapshot;
+    setTimer(snapshot);
+  }, []);
+
+  // P112-04 #6: stats refreshes are awaited after settlement and stale
+  // responses are dropped by a monotonically increasing sequence number, so
+  // an earlier query can never overwrite a newer value.
+  const statsSeqRef = useRef(0);
+  const refreshStats = useCallback(() => {
+    const seq = ++statsSeqRef.current;
+    const today = todayBoundary();
+    const week = weekRange();
+    const isFresh = () => seq === statsSeqRef.current;
+    const todayPromise = gateway.getStatistics({ from: today.from, to: today.to, days: [today] })
+      .then(stats => { if (isFresh()) setTodayStats(stats); });
+    const weekPromise = gateway.getStatistics({ from: week.from, to: week.to, days: weekBoundaries() })
+      .then(stats => { if (isFresh()) setWeekStats(stats); });
+    return Promise.all([todayPromise, weekPromise]).then(() => undefined);
+  }, [gateway]);
 
   // Full resync after an unexpected gateway failure (e.g. CONFLICT).
   const resync = useCallback(() => {
@@ -250,13 +282,14 @@ export default function App() {
         setTasks(payload.tasks);
         setTags(payload.tags);
         setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
-        setTags(payload.tags);
         setSettings(payload.settings);
-        applyTimer(payload.timer);
-        setTodayStats(payload.statistics);
+        applyTimerForced(payload.timer);
+        // P112-04 #7: bootstrap.statistics is ALL-TIME - never present it as
+        // today. refreshStats below fills the authoritative today/week rows.
+        refreshStats();
       })
       .catch(() => undefined);
-  }, [gateway, applyTimer]);
+  }, [gateway, applyTimerForced, refreshStats]);
 
   // v1.2: categories/projects power the forms; progress feeds rows & selector.
   const refreshTaskData = useCallback(() => {
@@ -267,16 +300,6 @@ export default function App() {
     }).catch(() => undefined);
   }, [gateway]);
 
-  const refreshStats = useCallback(() => {
-    const { from, to } = weekRange();
-    gateway.getStatistics({ from, to, days: weekBoundaries() })
-      .then(stats => { setWeekStats(stats); })
-      .catch(() => undefined);
-    const today = todayBoundary();
-    gateway.getStatistics({ from: today.from, to: today.to, days: [today] })
-      .then(stats => { setTodayStats(stats); })
-      .catch(() => undefined);
-  }, [gateway]);
 
   const runStart = useCallback(async (snapshot: TimerSnapshot, mode: TimerMode, taskId: string | null) => {
     const next = await gateway.startTimer({ mode, selectedTaskId: taskId, expectedRevision: snapshot.revision });
@@ -291,12 +314,11 @@ export default function App() {
       recovery,
     });
     applyTimer(result.timer);
-    // v1.1.2 C1: append only a genuinely new, statistics-eligible record
-    // (breaks and sub-30s sessions never enter the activity view), head-
-    // inserted (the array is newest-first) and deduped by id.
-    if (result.newlyCompleted && result.session.statisticsEligible) {
-      setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
-    }
+    // R02: merge on EVERY successful response - including replays with
+    // newlyCompleted=false (a first response may have been lost; the retry
+    // must still restore the record). Eligibility gates visibility inside
+    // upsertLogNewestFirst; newlyCompleted only gates the one-shot effects.
+    setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
 
     if (result.newlyCompleted && !recovery) {
       const s = settingsRef.current;
@@ -309,13 +331,22 @@ export default function App() {
     }
   }, [gateway, applyTimer, runStart]);
 
+  // P112-04 #5: concurrent expiry triggers for the same session collapse
+  // into one settlement request; late arrivals are dropped.
+  const inflightExpiresRef = useRef<Set<string>>(new Set());
   const handleExpire = useCallback(async () => {
     const cur = timerRef.current;
-    if (!cur) return;
-    // v1.1.2 C2: stats refresh AFTER the completion settles — a concurrent
-    // read could observe the pre-completion totals.
-    await runComplete(cur, false).catch(resync);
-    refreshStats();
+    if (!cur || !cur.activeSessionId) return;
+    if (inflightExpiresRef.current.has(cur.activeSessionId)) return;
+    inflightExpiresRef.current.add(cur.activeSessionId);
+    try {
+      // Stats refresh AFTER the completion settles - a concurrent read could
+      // observe the pre-completion totals.
+      await runComplete(cur, false).catch(resync);
+      await refreshStats();
+    } finally {
+      inflightExpiresRef.current.delete(cur.activeSessionId);
+    }
   }, [runComplete, resync, refreshStats]);
 
   const handleStart = useCallback((mode: TimerMode, taskId: string | null) => {
@@ -357,17 +388,11 @@ export default function App() {
     })
       .then(result => {
         applyTimer(result.timer);
-        if (result.newlyClosed && result.closedSession) {
-          const closed = result.closedSession;
-          // v1.1 invariant: the activity view only shows eligible sessions —
-          // a sub-30s switch record stays out of the list and statistics.
-          if (closed.statisticsEligible) {
-            setLogs(p => upsertLogNewestFirst(p, sessionToLog(closed)));
-            refreshStats();
-            setToast(`已保存「${closed.taskTitleSnapshot}」的 ${Math.max(1, Math.round(closed.focusedSeconds / 60))} 分钟，开始新一轮`);
-          } else {
-            setToast(`「${closed.taskTitleSnapshot}」本次不足 30 秒，未计入统计；已开始新一轮`);
-          }
+        if (result.newlyClosed) {
+          // v1.2 same-clock switch: no session is written mid-round; each
+          // task keeps its own effective time in the segment ledger.
+          refreshStats();
+          setToast("已切换任务；两段专注分别记账，本轮时间不重置");
         }
       })
       .catch(() => {
@@ -410,9 +435,9 @@ export default function App() {
     })
       .then(result => {
         applyTimer(result.timer);
+        // R02: merge on every response (idempotent replays restore the row).
+        setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
         if (result.newlyFinished) {
-          // v1.1.2 C1: head-insert (newest-first), deduped by session id.
-          setLogs(p => upsertLogNewestFirst(p, sessionToLog(result.session)));
           refreshStats();
           if (result.statisticsEligible) {
             setToast(`已记录 ${formatFocusedDuration(result.session.focusedSeconds)} 专注`);
@@ -489,9 +514,11 @@ export default function App() {
   // (sound/notify/auto-break fire once, guarded by newlyCompleted).
   useEffect(() => {
     return gateway.subscribeTimerSettled(payload => {
-      applyTimer(payload.timer);
+      // Backend-authoritative result - apply without the revision guard.
+      applyTimerForced(payload.timer);
+      // R02: merge every settlement (idempotent replays included).
+      setLogs(p => upsertLogNewestFirst(p, sessionToLog(payload.session)));
       if (payload.newlyCompleted) {
-        setLogs(p => upsertLogNewestFirst(p, sessionToLog(payload.session)));
         refreshStats();
         const s = settingsRef.current;
         if (s?.soundEnabled) playCompletionSound();
@@ -543,7 +570,7 @@ export default function App() {
         setTags(payload.tags);
         setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
         setSettings(payload.settings);
-        applyTimer(payload.timer);
+        applyTimerForced(payload.timer);
         refreshTaskData();
         const t = payload.timer;
         if (t.state === "running" && t.activeSessionId && t.targetEndAt && Date.now() >= t.targetEndAt) {
@@ -551,9 +578,15 @@ export default function App() {
         }
         refreshStats();
       })
-      .catch(() => undefined);
+      .catch(err => {
+        // R06: an old-schema database holds the app in prep mode - the
+        // migration screen takes over until the user confirms or cancels.
+        if (err && (err as { code?: string }).code === "MIGRATION_REQUIRED") {
+          setMigrationPending(true);
+        }
+      });
     return () => { cancelled = true; };
-  }, [gateway, applyTimer, runComplete, resync, refreshStats, refreshTaskData]);
+  }, [gateway, applyTimerForced, runComplete, resync, refreshStats, refreshTaskData]);
 
   const saveSettings = useCallback(async (next: AppSettings) => {
     const result = await gateway.saveSettings(next);

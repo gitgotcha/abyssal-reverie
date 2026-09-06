@@ -8,6 +8,7 @@ function log(id: string, startedAt: number, task = id): SessionLog {
   return {
     id, startedAt, time: '10:00', duration: 1, task,
     mode: 'focus' as TimerMode, status: 'completed', tag: null,
+    endedAt: startedAt + 60_000, focusedSeconds: 60, statisticsEligible: true,
   }
 }
 

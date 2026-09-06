@@ -1,6 +1,8 @@
 import type {
   AppSettings,
   MiniWindowPrefs,
+  MigrationPreview,
+  MigrationParams,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -94,6 +96,12 @@ export interface AppGateway {
   toggleMiniWindow(): Promise<void>
   loadMiniPrefs(): Promise<MiniWindowPrefs>
   saveMiniPrefs(prefs: MiniWindowPrefs): Promise<void>
+  // ─── Migration preparation (R06) ────────────────────────────────────────────
+  previewMigration(): Promise<MigrationPreview>
+  /** Applies the migration with the user's confirmed parameters. */
+  confirmMigration(params: MigrationParams): Promise<BootstrapPayload>
+  /** Declines the upgrade — the app exits without touching any data. */
+  cancelUpgrade(): Promise<void>
   /** v1.3 C4: undo a task completion; real recorded segments stay. */
   undoCompleteTask(taskId: string): Promise<Task>
   /** Subscribes to tray menu actions (pause/resume, reset). Returns an unsubscribe. */

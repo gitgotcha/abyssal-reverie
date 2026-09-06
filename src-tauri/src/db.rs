@@ -7,7 +7,7 @@ use crate::error::CommandError;
 use crate::models::{AppSettings, TimerMode, TimerSnapshot};
 
 /// Bump this whenever a new migration is appended to `MIGRATIONS`.
-const LATEST_SCHEMA_VERSION: u32 = 4;
+pub const LATEST_SCHEMA_VERSION: u32 = 4;
 
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
@@ -357,6 +357,24 @@ fn open_and_configure(path: &Path) -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
+/// R06: opens an OLD-schema database WITHOUT migrating it — preparation mode.
+/// The connection may only serve preview/confirm/cancel until the user
+/// decides; all business commands are gated on `AppState.migration_pending`.
+pub fn open_prepared(path: &Path) -> Result<Connection, CommandError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                CommandError::internal(format!(
+                    "failed to create database directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let conn = open_and_configure(path).map_err(CommandError::from)?;
+    Ok(conn)
+}
+
 /// Runs migrations and seeds defaults on an already-configured connection.
 fn migrate_and_seed(conn: &mut Connection) -> Result<(), CommandError> {
     run_migrations(conn)?;
@@ -565,6 +583,20 @@ fn v4_now() -> i64 {
 ///   (effective time = focused_seconds; boundaries approximated from
 ///   started_at).
 pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
+    // Default parameters: current settings as the budget basis, 通用 stays
+    // standalone. Used by tests and by open_at's auto path; the interactive
+    // startup path (R06) passes explicit user-confirmed parameters.
+    let params = crate::models::MigrationParams {
+        budget_focus_minutes: 0, // 0 = read from settings
+        general_mapping: "standalone".to_owned(),
+    };
+    run_v4_migration_with(tx, &params)
+}
+
+/// R06: the semantic migration honours the user's confirmed decisions —
+/// budget basis minutes and the 通用 mapping. Nothing here runs before the
+/// frontend has shown the preview and received an explicit confirmation.
+pub fn run_v4_migration_with(tx: &Transaction<'_>, params: &crate::models::MigrationParams) -> Result<(), CommandError> {
     let now = v4_now();
 
     tx.execute_batch(
@@ -674,7 +706,8 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
     )?;
 
     // Consolidate identical trimmed legacy project names into real projects
-    // under the fallback category. `通用` and blank stay standalone.
+    // under the fallback category. Blank names stay standalone; 通用 follows
+    // the user's R06 decision (standalone default, or one real project).
     tx.execute(
         "INSERT INTO projects (id, profile_id, category_id, name, normalized_name, sort_order, created_at, updated_at)
          SELECT 'prj-' || hex(randomblob(8)), 'local',
@@ -682,16 +715,16 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
                 t.pname, t.pname,
                 ROW_NUMBER() OVER (ORDER BY t.pname) - 1, ?1, ?1
          FROM (SELECT DISTINCT TRIM(project) AS pname FROM tasks) t
-         WHERE t.pname <> '' AND t.pname <> '通用'",
-        params![now],
+         WHERE t.pname <> '' AND (t.pname <> '通用' OR ?2 = 'project')",
+        params![now, params.general_mapping],
     )?;
     tx.execute(
         "UPDATE tasks SET project_id = (
             SELECT p.id FROM projects p
             WHERE p.profile_id = 'local' AND p.normalized_name = TRIM(tasks.project)
          )
-         WHERE TRIM(project) <> '' AND TRIM(project) <> '通用'",
-        [],
+         WHERE TRIM(project) <> '' AND (TRIM(project) <> '通用' OR ?1 = 'project')",
+        params![params.general_mapping],
     )?;
 
     // Status mirrors the legacy done flag.
@@ -700,12 +733,23 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
         [],
     )?;
 
-    // Budget snapshot estimated from the user's current focus duration.
+    // R06: budget snapshot estimated from the USER-CONFIRMED basis minutes
+    // (falling back to the current settings when the startup path took the
+    // default). Marked budget_source='migration' — an estimate, never exact
+    // history.
+    let basis_minutes = if params.budget_focus_minutes > 0 {
+        params.budget_focus_minutes
+    } else {
+        tx.query_row(
+            "SELECT COALESCE((SELECT focus_duration_minutes FROM settings WHERE id = 1), 25)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    };
     tx.execute(
         "UPDATE tasks
-         SET target_seconds = pomodoro_target *
-             COALESCE((SELECT focus_duration_minutes FROM settings WHERE id = 1), 25) * 60",
-        [],
+         SET target_seconds = pomodoro_target * ?1 * 60",
+        params![basis_minutes],
     )?;
     tx.execute(
         "INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds, source, created_at)
@@ -752,6 +796,78 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// R06: migration entry that carries the user-confirmed parameters down to
+/// the v4 semantic step.
+pub fn run_migrations_with(conn: &mut Connection, params: &crate::models::MigrationParams) -> Result<(), CommandError> {
+    let current = schema_version(conn)?;
+    if current > LATEST_SCHEMA_VERSION {
+        return Err(CommandError::database_too_new(current, LATEST_SCHEMA_VERSION));
+    }
+    if current >= LATEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // Re-run older steps exactly like run_migrations (shared code path).
+    if current < 1 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATION_V1)?;
+        tx.pragma_update(None, "user_version", 1u32)?;
+        tx.commit()?;
+    }
+    if current < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATION_V2)?;
+        tx.pragma_update(None, "user_version", 2u32)?;
+        tx.commit()?;
+    }
+    if current < 3 {
+        let tx = conn.transaction()?;
+        run_v3_migration(&tx)?;
+        tx.pragma_update(None, "user_version", 3u32)?;
+        tx.commit()?;
+    }
+    if current < 4 {
+        let tx = conn.transaction()?;
+        run_v4_migration_with(&tx, params)?;
+        tx.pragma_update(None, "user_version", 4u32)?;
+        tx.commit()?
+    }
+    Ok(())
+}
+
+/// R06: read-only preview of the pending semantic migration. Runs against a
+/// v3 database and changes NOTHING — the numbers shown are the numbers the
+/// user confirms before any conversion happens.
+pub fn preview_v4_migration(conn: &Connection) -> Result<crate::models::MigrationPreview, CommandError> {
+    use crate::models::MigrationPreview;
+    let version = schema_version(conn)?;
+    if version >= LATEST_SCHEMA_VERSION {
+        return Err(CommandError::validation("database does not need migration"));
+    }
+    let task_count: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?;
+    let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    let general_task_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE TRIM(project) = '通用'", [], |r| r.get(0))?
+    ;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT TRIM(project) FROM tasks WHERE TRIM(TRIM(project)) <> '' AND TRIM(project) <> '通用' ORDER BY 1"
+    )?;
+    let projects_to_create = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let suggested_focus_minutes: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT focus_duration_minutes FROM settings WHERE id = 1), 25)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(MigrationPreview {
+        schema_version: version,
+        task_count,
+        session_count,
+        projects_to_create,
+        general_task_count,
+        suggested_focus_minutes,
+    })
+}
 /// Inserts the single settings row and idle timer row if they are missing.
 pub fn seed_defaults(conn: &Connection) -> Result<(), CommandError> {
     let settings = AppSettings::default();
@@ -1146,6 +1262,93 @@ mod tests {
         assert_eq!(seg, 1_200_000);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds a v3-schema in-memory database with seeded defaults.
+    fn v3_database() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("mem db");
+        configure(&conn, false).expect("configure");
+        {
+            let tx = conn.transaction().expect("tx");
+            tx.execute_batch(MIGRATION_V1).expect("v1");
+            tx.pragma_update(None, "user_version", 1u32).expect("v1");
+            tx.commit().expect("v1");
+        }
+        {
+            let tx = conn.transaction().expect("tx");
+            tx.execute_batch(MIGRATION_V2).expect("v2");
+            tx.pragma_update(None, "user_version", 2u32).expect("v2");
+            tx.commit().expect("v2");
+        }
+        {
+            let tx = conn.transaction().expect("tx");
+            run_v3_migration(&tx).expect("v3");
+            tx.pragma_update(None, "user_version", 3u32).expect("v3");
+            tx.commit().expect("v3");
+        }
+        seed_defaults(&conn).expect("seed");
+        conn
+    }
+
+    #[test]
+    fn migration_preview_reads_v3_without_converting() {
+        let conn = v3_database();
+        let fallback: String = conn
+            .query_row("SELECT id FROM tags WHERE is_fallback = 1", [], |r| r.get(0))
+            .expect("fallback tag");
+        conn.execute(
+            "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id, sort_order, created_at, updated_at, completed_at)
+             VALUES ('t1', '数据库迁移', 0, 2, 'med', 'Java 面试', ?1, 0, 1, 1, NULL),
+                    ('t2', '看书', 0, 1, 'low', '通用', ?1, 1, 1, 1, NULL)",
+            params![fallback],
+        ).expect("tasks");
+
+        let preview = preview_v4_migration(&conn).expect("preview");
+        assert_eq!(preview.schema_version, 3);
+        assert_eq!(preview.task_count, 2);
+        assert_eq!(preview.projects_to_create, vec!["Java 面试".to_owned()]);
+        assert_eq!(preview.general_task_count, 1);
+        // The preview must not have touched the data.
+        let version = schema_version(&conn).expect("version");
+        assert_eq!(version, 3, "preview is read-only");
+    }
+
+    #[test]
+    fn confirmed_migration_honours_user_parameters() {
+        let mut conn = v3_database();
+        let fallback: String = conn
+            .query_row("SELECT id FROM tags WHERE is_fallback = 1", [], |r| r.get(0))
+            .expect("fallback tag");
+        conn.execute(
+            "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id, sort_order, created_at, updated_at, completed_at)
+             VALUES ('t1', '数据库迁移', 0, 2, 'med', 'Java 面试', ?1, 0, 1, 1, NULL),
+                    ('t2', '看书', 0, 1, 'low', '通用', ?1, 1, 1, 1, NULL)",
+            params![fallback],
+        ).expect("tasks");
+
+        // The user confirmed a 40-minute budget basis and a real 通用 project.
+        let params = crate::models::MigrationParams {
+            budget_focus_minutes: 40,
+            general_mapping: "project".to_owned(),
+        };
+        run_migrations_with(&mut conn, &params).expect("migrate");
+        assert_eq!(schema_version(&conn).expect("version"), LATEST_SCHEMA_VERSION);
+
+        // Budget honours the confirmed basis: 2 × 40min × 60 = 4800s.
+        let target: i64 = conn
+            .query_row("SELECT target_seconds FROM tasks WHERE id = 't1'", [], |r| r.get(0))
+            .expect("target");
+        assert_eq!(target, 4800);
+
+        // 通用 became a real project per the user's choice.
+        let general: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects WHERE normalized_name = '通用'", [], |r| r.get(0))
+            .expect("general project");
+        assert_eq!(general, 1);
+        let t2_project: Option<String> = conn
+            .query_row("SELECT project_id FROM tasks WHERE id = 't2'", [], |r| r.get(0))
+            .expect("t2 link");
+        assert!(t2_project.is_some());
     }
 
     #[test]
@@ -1600,7 +1803,7 @@ mod tests {
 /// Reads `user_version` from a THROWAWAY COPY of the {db, -wal, -shm} set so
 /// the check sees committed WAL pages without opening the source for writing.
 /// Returns `Ok(None)` when the source does not exist (fresh install).
-fn probe_schema_version(path: &Path) -> Result<Option<u32>, CommandError> {
+pub fn probe_schema_version(path: &Path) -> Result<Option<u32>, CommandError> {
     if !path.exists() {
         return Ok(None);
     }

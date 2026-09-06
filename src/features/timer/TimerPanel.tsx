@@ -249,6 +249,22 @@ export function TimerPanel({ timer, tasks, taskProgress, selectedTaskId, onSelec
               letterSpacing: "0.10em", color: C.textMuted, marginBottom: 7,
               textTransform: "uppercase",
             }}>当前任务</div>
+            {/* P112-03: the bound task may have been completed or archived
+                 mid-round. The backend snapshot stays the single truth -
+                 show it with an explicit note, never a fake highlight. */}
+            {active && timer?.selectedTaskId && !activeTasks.some(t => t.id === timer.selectedTaskId) && (
+              <div style={{ padding: "8px 12px", marginBottom: 4, ...CARD, border: `1px solid ${C.hairlineStr}` }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <svg width="5" height="5" viewBox="0 0 6 6" style={{ flexShrink: 0 }}>
+                    <circle cx="3" cy="3" r="2.4" fill={C.silver} />
+                  </svg>
+                  <span style={{ flex: 1, fontSize: 11, fontFamily: "var(--font-sans)", color: C.textSec, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {timer.taskTitleSnapshot ?? "未指定任务"}
+                  </span>
+                  <span style={{ fontSize: 9, color: C.textMuted, fontFamily: "var(--font-sans)" }}>本轮任务已不在待办列表</span>
+                </div>
+              </div>
+            )}
             {activeTasks.length === 0 ? (
               <div style={{ padding: "9px 12px", ...CARD, color: C.textMuted, fontSize: 11, fontFamily: "var(--font-sans)", fontStyle: "italic" }}>
                 暂无任务，前往任务面板添加

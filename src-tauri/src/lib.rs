@@ -21,6 +21,10 @@ const GLOBAL_SHORTCUT: &str = "CommandOrControl+Alt+Space";
 /// Managed Tauri state: the single SQLite connection shared by every command.
 pub struct AppState {
     pub db: Mutex<Connection>,
+    /// R06: true when the on-disk schema is older than the app and the user
+    /// has NOT yet confirmed the semantic migration. In this mode every
+    /// business command is gated; only preview/confirm/cancel run.
+    pub migration_pending: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
@@ -90,24 +94,55 @@ pub fn run() {
             // v1.1.2 E2: a database written by a NEWER version must stop the
             // old program with a clear, actionable message — never migrate it,
             // never open it read-write, never silently rebuild it.
-            let conn = match db::open_at(&db_path) {
-                Ok(conn) => conn,
-                Err(err) if err.code == crate::error::ErrorCode::DatabaseTooNew => {
+            // R06 startup sequence: probe a throwaway COPY first (zero source
+            // writes), then either open ready-to-run, refuse a future schema,
+            // or open in MIGRATION-PREP mode for an old schema.
+            let probe_version = db::probe_schema_version(&db_path).unwrap_or(None);
+            let conn = match probe_version {
+                Some(v) if v > db::LATEST_SCHEMA_VERSION => {
                     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
                     let _ = app
                         .dialog()
-                        .message(format!(
-                            "{err}\n\n数据库位置：{}",
-                            db_path.display()
-                        ))
+                        .message(format!("{}\n\n数据库位置：{}",
+                            crate::error::CommandError::database_too_new(v, db::LATEST_SCHEMA_VERSION).message,
+                            db_path.display()))
                         .title("无法启动 Abyssal Reverie")
                         .kind(MessageDialogKind::Error)
                         .blocking_show();
                     std::process::exit(1);
                 }
-                Err(err) => return Err(Box::new(err)),
+                // Old schema: open WITHOUT migrating — the user confirms the
+                // semantic migration (budget basis, 通用 mapping) first.
+                Some(v) if v > 0 && v < db::LATEST_SCHEMA_VERSION => {
+                    let conn = db::open_prepared(&db_path)?;
+                    app.manage(AppState {
+                        db: Mutex::new(conn),
+                        migration_pending: std::sync::atomic::AtomicBool::new(true),
+                    });
+                    return Ok(());
+                }
+                // Latest schema or fresh install.
+                _ => match db::open_at(&db_path) {
+                    Ok(conn) => conn,
+                    Err(err) if err.code == crate::error::ErrorCode::DatabaseTooNew => {
+                        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                        let _ = app
+                            .dialog()
+                            .message(format!("{}\n\n数据库位置：{}",
+                                err.message,
+                                db_path.display()))
+                            .title("无法启动 Abyssal Reverie")
+                            .kind(MessageDialogKind::Error)
+                            .blocking_show();
+                        std::process::exit(1);
+                    }
+                    Err(err) => return Err(Box::new(err)),
+                },
             };
-            app.manage(AppState { db: Mutex::new(conn) });
+            app.manage(AppState {
+                db: Mutex::new(conn),
+                migration_pending: std::sync::atomic::AtomicBool::new(false),
+            });
 
             tray::build_tray(app.handle())?;
 
@@ -188,6 +223,9 @@ pub fn run() {
             commands::get_task_progress,
             commands::get_all_task_progress,
             commands::complete_task_now,
+            commands::preview_migration,
+            commands::confirm_migration,
+            commands::cancel_upgrade,
             commands::show_main_window,
             commands::toggle_mini_window,
             commands::load_mini_prefs,

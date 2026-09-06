@@ -14,6 +14,10 @@ pub enum ErrorCode {
     /// app. The old program must refuse to open it (no writes at all) rather
     /// than risk corrupting a schema it does not understand.
     DatabaseTooNew,
+    /// R06: an old-schema database needs a semantic migration that REQUIRES
+    /// user confirmation first (budget basis, 通用 mapping). The startup
+    /// connection opens in preparation mode until the user decides.
+    MigrationRequired,
 }
 
 impl ErrorCode {
@@ -25,6 +29,7 @@ impl ErrorCode {
             ErrorCode::DatabaseError => "DATABASE_ERROR",
             ErrorCode::InternalError => "INTERNAL_ERROR",
             ErrorCode::DatabaseTooNew => "DATABASE_TOO_NEW",
+            ErrorCode::MigrationRequired => "MIGRATION_REQUIRED",
         }
     }
 }
@@ -64,6 +69,16 @@ impl CommandError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self { code: ErrorCode::InternalError, message: message.into() }
+    }
+
+    pub fn migration_required(current: u32, target: u32) -> Self {
+        Self {
+            code: ErrorCode::MigrationRequired,
+            message: format!(
+                "数据库结构 v{current} 需要升级到 v{target}；请先确认迁移预览（预算基准、通用项目映射）。\
+                 确认前不会修改任何业务数据。"
+            ),
+        }
     }
 
     pub fn database_too_new(current: u32, supported: u32) -> Self {

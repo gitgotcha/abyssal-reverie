@@ -5,6 +5,8 @@ import type { AppGateway } from './appGateway'
 import type {
   AppSettings,
   MiniWindowPrefs,
+  MigrationPreview,
+  MigrationParams,
   Category,
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -83,6 +85,9 @@ export class TauriAppGateway implements AppGateway {
   toggleMiniWindow() { return invoke<void>('toggle_mini_window') }
   loadMiniPrefs() { return invoke<MiniWindowPrefs>('load_mini_prefs') }
   saveMiniPrefs(prefs: MiniWindowPrefs) { return invoke<void>('save_mini_prefs', { prefs }) }
+  previewMigration() { return invoke<MigrationPreview>('preview_migration') }
+  confirmMigration(params: MigrationParams) { return invoke<BootstrapPayload>('confirm_migration', { params }) }
+  cancelUpgrade() { return invoke<void>('cancel_upgrade') }
   undoCompleteTask(taskId: string) { return invoke<Task>('undo_complete_task', { taskId }) }
 
   saveSettings(input: AppSettings) { return invoke<SaveSettingsResult>('save_settings', { input }) }

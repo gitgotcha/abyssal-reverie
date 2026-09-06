@@ -145,8 +145,26 @@ export interface Statistics {
 }
 
 export interface CommandError {
-  code: 'VALIDATION_ERROR' | 'NOT_FOUND' | 'CONFLICT' | 'DATABASE_ERROR' | 'INTERNAL_ERROR' | 'DATABASE_TOO_NEW'
+  code: 'VALIDATION_ERROR' | 'NOT_FOUND' | 'CONFLICT' | 'DATABASE_ERROR' | 'INTERNAL_ERROR' | 'DATABASE_TOO_NEW' | 'MIGRATION_REQUIRED'
   message: string
+}
+
+/** R06: read-only preview of a pending v3 → v4 semantic migration. */
+export interface MigrationPreview {
+  schemaVersion: number
+  taskCount: number
+  sessionCount: number
+  projectsToCreate: string[]
+  generalTaskCount: number
+  suggestedFocusMinutes: number
+}
+
+/** R06: the user's confirmed migration decisions. */
+export interface MigrationParams {
+  /** Minutes per pomodoro for legacy budget estimates. */
+  budgetFocusMinutes: number
+  /** "standalone" | "project" */
+  generalMapping: string
 }
 
 /** v1.1 §10.4 — which sessions a query may return. */

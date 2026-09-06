@@ -31,6 +31,16 @@ fn lock_db<'a>(state: &'a State<'_, AppState>) -> Result<MutexGuard<'a, Connecti
 
 #[tauri::command]
 pub fn bootstrap_app(state: State<'_, AppState>) -> Result<BootstrapPayload, CommandError> {
+    // R06: while an old-schema migration awaits user confirmation, no
+    // business payload may be served.
+    if state
+        .migration_pending
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let conn = lock_db(&state)?;
+        let version = crate::db::schema_version(&conn)?;
+        return Err(CommandError::migration_required(version, crate::db::LATEST_SCHEMA_VERSION));
+    }
     let conn = lock_db(&state)?;
 
     Ok(BootstrapPayload {
@@ -164,6 +174,56 @@ pub fn complete_task_now(app: tauri::AppHandle, state: State<'_, AppState>, inpu
     let result = repository::complete_task_now(&mut conn, &input)?;
     let _ = app.emit("timer-changed", &result.timer);
     Ok(result)
+}
+
+// ─── Migration preparation (R06) ─────────────────────────────────────────────
+
+/// Read-only preview of the pending semantic migration. Changes NOTHING.
+#[tauri::command]
+pub fn preview_migration(state: State<'_, AppState>) -> Result<crate::models::MigrationPreview, CommandError> {
+    let conn = lock_db(&state)?;
+    crate::db::preview_v4_migration(&conn)
+}
+
+/// Applies the migration with the user's confirmed parameters, then returns
+/// the full bootstrap payload so the UI can continue without a restart.
+#[tauri::command]
+pub fn confirm_migration(
+    state: State<'_, AppState>,
+    params: crate::models::MigrationParams,
+) -> Result<BootstrapPayload, CommandError> {
+    if !state
+        .migration_pending
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(CommandError::validation("no migration is pending"));
+    }
+    if params.budget_focus_minutes < 1 || params.budget_focus_minutes > 180 {
+        return Err(CommandError::validation("budget_focus_minutes must be 1..=180"));
+    }
+    if params.general_mapping != "standalone" && params.general_mapping != "project" {
+        return Err(CommandError::validation("general_mapping must be standalone|project"));
+    }
+    let mut conn = lock_db(&state)?;
+    crate::db::run_migrations_with(&mut conn, &params)?;
+    crate::db::seed_defaults(&conn)?;
+    state
+        .migration_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    Ok(BootstrapPayload {
+        tasks: repository::list_tasks(&conn)?,
+        tags: repository::list_tags(&conn)?,
+        settings: repository::get_settings(&conn)?,
+        timer: repository::get_timer(&conn)?,
+        sessions: repository::list_sessions(&conn, BOOTSTRAP_SESSION_LIMIT)?,
+        statistics: repository::all_time_statistics(&conn)?,
+    })
+}
+
+/// The user declined the upgrade — exit without touching any data.
+#[tauri::command]
+pub fn cancel_upgrade(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 // ─── Mini window (v1.3 B/C) ──────────────────────────────────────────────────

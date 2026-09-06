@@ -32,6 +32,9 @@ export function sessionToLog(session: TimerSession): SessionLog {
     tag: session.tagNameSnapshot ?? null,
     mode: session.mode,
     status: session.status,
+    endedAt: session.endedAt,
+    focusedSeconds: session.focusedSeconds,
+    statisticsEligible: session.statisticsEligible === true,
   };
 }
 
@@ -43,11 +46,22 @@ export function sessionToLog(session: TimerSession): SessionLog {
  */
 export function sortLogsDesc(logs: SessionLog[]): SessionLog[] {
   return [...logs].sort((a, b) =>
-    (b.startedAt - a.startedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    (b.startedAt - a.startedAt) || (a.id > b.id ? -1 : a.id < b.id ? 1 : 0));
 }
 
-/** Head-insert (or replace) a log into the newest-first array, deduped by id. */
+/**
+ * R02: merge a session response into the activity view on EVERY successful
+ * command — including replays where newlyCompleted/newlyFinished is false
+ * (a first response may have been lost; the retry must still restore the
+ * record). Visibility is gated by the backend's authoritative
+ * statisticsEligible; newly* flags only ever gate one-shot side effects
+ * (sound, notification, auto-break).
+ */
 export function upsertLogNewestFirst(logs: SessionLog[], log: SessionLog): SessionLog[] {
+  if (!log.statisticsEligible) {
+    // Not activity-visible: drop any stale copy it may have left behind.
+    return sortLogsDesc(logs.filter(l => l.id !== log.id));
+  }
   return sortLogsDesc([log, ...logs.filter(l => l.id !== log.id)]);
 }
 
