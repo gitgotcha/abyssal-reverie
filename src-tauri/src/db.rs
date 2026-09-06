@@ -284,26 +284,42 @@ pub fn open_at(path: &Path) -> Result<Connection, CommandError> {
         }
     }
 
-    // Phase 0 — v1.1.2 E1: refuse a database written by a NEWER version of
-    // the app BEFORE any pragma or write (including the WAL journal switch in
-    // `configure`) touches the file. The probe connection only reads
-    // `user_version`; `Connection::open` itself never writes. A probe failure
-    // (garbage/corrupt file) falls through to the normal corruption handling
-    // in Phase 1/2.
-    let probe = Connection::open(path).ok().and_then(|conn| schema_version(&conn).ok());
-    if let Some(version) = probe {
-        if version > LATEST_SCHEMA_VERSION {
-            return Err(CommandError::database_too_new(version, LATEST_SCHEMA_VERSION));
+    // Phase 0 — v1.1.2 E1 + P112-06.6: refuse a database written by a NEWER
+    // version of the app BEFORE anything touches the source. The check runs
+    // against a THROWAWAY COPY of the {db, -wal, -shm} set, so even a WAL-mode
+    // database is evaluated with its committed pages (never just the main
+    // file header), and the source is not opened for writing at all. A probe
+    // failure (garbage/corrupt file) falls through to the normal corruption
+    // handling in Phase 1/2.
+    if path.exists() {
+        match probe_schema_version(path) {
+            Ok(Some(version)) if version > LATEST_SCHEMA_VERSION => {
+                return Err(CommandError::database_too_new(version, LATEST_SCHEMA_VERSION));
+            }
+            Ok(_) => {}
+            Err(_) => {} // unreadable copy: Phase 1/2 produce the real diagnosis
         }
     }
 
-    // Phase 1 — open + configure. An unreadable/unopenable file is treated as
-    // corrupt media and goes through the recovery path.
+    // Phase 1 — open + configure. P112-06.3: permission problems, lock
+    // contention and I/O errors must NOT be treated as corruption and must
+    // never rename the user's file aside. Only a file that OPENS but fails
+    // the explicit corruption diagnosis goes through recovery.
+    // Phase 1 - open + configure. P112-06.3: permission problems, lock
+    // contention and I/O errors must NOT be treated as corruption and must
+    // never rename the user's file aside. Only an explicit SQLite corruption
+    // diagnosis (NOTADB / CORRUPT) opens the recovery path.
     let mut conn = match open_and_configure(path) {
         Ok(conn) => conn,
-        Err(_) => {
+        Err(err) if is_corruption_diagnosis(&err) => {
             recover_corrupt(path)?;
             return fresh_database(path);
+        }
+        Err(err) => {
+            return Err(CommandError::database(format!(
+                "cannot open database at {} (locked, permission denied, or I/O error); the file was left untouched: {err}",
+                path.display()
+            )));
         }
     };
 
@@ -335,7 +351,7 @@ pub fn open_at(path: &Path) -> Result<Connection, CommandError> {
 }
 
 /// Opens and configures a connection without migrating or seeding.
-fn open_and_configure(path: &Path) -> Result<Connection, CommandError> {
+fn open_and_configure(path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(path)?;
     configure(&conn, true)?;
     Ok(conn)
@@ -351,17 +367,29 @@ fn migrate_and_seed(conn: &mut Connection) -> Result<(), CommandError> {
 /// Recovery path for corrupt media: create a fresh, fully migrated and seeded
 /// database at `path` (the corrupt file has already been renamed aside).
 fn fresh_database(path: &Path) -> Result<Connection, CommandError> {
-    let mut conn = open_and_configure(path)?;
+    let mut conn = open_and_configure(path).map_err(CommandError::from)?;
     migrate_and_seed(&mut conn)?;
     Ok(conn)
 }
 
-/// Copies the database file aside as `<name>.pre-v<target>-<timestamp>.bak`
-/// before an in-place schema upgrade, so a failed/corrupted upgrade always has
-/// a restorable snapshot. The WAL is checkpointed first so the copy includes
-/// every committed transaction.
+/// Creates a VERIFIED pre-migration backup (P112-06.5/7):
+/// 1. checkpoint(TRUNCATE) — its busy result is CHECKED; a busy checkpoint
+///    means readers/writers are active and the copy would be inconsistent.
+/// 2. copy the (now complete) main file to a fresh `.pre-v<N>-<ts>.bak` path.
+/// 3. verify the copy by opening it read-only: integrity ok + schema version
+///    matches the source. Any failure aborts the migration — the original
+///    database stays untouched.
 fn backup_before_migration(conn: &Connection, path: &Path) -> Result<(), CommandError> {
-    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+    let checkpoint: (i64, i64, i64) = conn.query_row(
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if checkpoint.0 != 0 {
+        return Err(CommandError::database(format!(
+            "pre-migration checkpoint is busy ({checkpoint:?}); close other readers/writers              and retry — refusing to back up a partially-flushed database"
+        )));
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -371,7 +399,7 @@ fn backup_before_migration(conn: &Connection, path: &Path) -> Result<(), Command
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     if base.is_empty() {
-        return Ok(());
+        return Err(CommandError::internal("database path has no file name"));
     }
     let backup = path.with_file_name(format!("{base}.pre-v{LATEST_SCHEMA_VERSION}-{ts}.bak"));
     std::fs::copy(path, &backup).map_err(|err| {
@@ -380,7 +408,48 @@ fn backup_before_migration(conn: &Connection, path: &Path) -> Result<(), Command
             backup.display()
         ))
     })?;
-    Ok(())
+    // Verify the copy is a consistent, complete snapshot of the source. The
+    // copy inherits the source's WAL header, so the verifier opens it read-
+    // write ONLY to switch it to journal_mode=DELETE - making the snapshot
+    // self-contained (no .bak-wal/.bak-shm sidecars) - then checks integrity
+    // and the schema version. Any failure aborts the migration.
+    let source_version = schema_version(conn)?;
+    let verify = (|| {
+        let vconn = Connection::open(&backup)?;
+        let healthy: String = vconn.pragma_query_value(None, "integrity_check", |r| r.get(0))?;
+        if !healthy.eq_ignore_ascii_case("ok") {
+            return Err(CommandError::database(format!(
+                "pre-migration backup failed integrity check: {healthy}"
+            )));
+        }
+        vconn.pragma_update(None, "journal_mode", "DELETE")?;
+        let version: u32 = vconn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != source_version {
+            return Err(CommandError::database(format!(
+                "pre-migration backup version {version} != source {source_version}"
+            )));
+        }
+        Ok(())
+    })();
+    match verify {
+        Ok(()) => Ok(()),
+        Err(err) => Err(CommandError::database(format!(
+            "{err}; migration aborted, original database untouched"
+        ))),
+    }
+}
+
+/// True only for explicit SQLite corruption diagnoses — a locked, permission-
+/// denied or I/O-failing database must never be renamed aside (P112-06.3).
+fn is_corruption_diagnosis(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(ffi, _) => {
+            ffi.extended_code == rusqlite::ffi::SQLITE_NOTADB
+                || ffi.extended_code == rusqlite::ffi::SQLITE_CORRUPT
+                || ffi.code == rusqlite::ErrorCode::DatabaseCorrupt
+        }
+        _ => false,
+    }
 }
 
 /// A healthy database reports exactly "ok" from `PRAGMA integrity_check`.
@@ -420,7 +489,7 @@ fn recover_corrupt(path: &Path) -> Result<(), CommandError> {
 /// Applies the startup pragmas from the design spec: `foreign_keys = ON`,
 /// `busy_timeout = 5000`, plus `journal_mode = WAL` for file-backed databases
 /// (in-memory databases cannot use WAL).
-fn configure(conn: &Connection, persistent: bool) -> Result<(), CommandError> {
+fn configure(conn: &Connection, persistent: bool) -> Result<(), rusqlite::Error> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
     if persistent {
@@ -561,6 +630,12 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
             effective_ms          INTEGER NOT NULL CHECK (effective_ms >= 0),
             state                 TEXT NOT NULL DEFAULT 'pending'
                                   CHECK (state IN ('pending','confirmed','void')),
+            -- R08: 'effective_interval' = real run interval; 'legacy_total_only' =
+            -- only the total is accurate (old sessions have no pause ledger), the
+            -- start/end pair is metadata and must never be treated as a precise
+            -- interval (no union maths, no cross-midnight splitting).
+            temporal_precision    TEXT NOT NULL DEFAULT 'effective_interval'
+                                  CHECK (temporal_precision IN ('effective_interval','legacy_total_only')),
             created_at            INTEGER NOT NULL
         );
         CREATE INDEX idx_segments_session ON focus_segments(session_id);
@@ -638,19 +713,28 @@ pub fn run_v4_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
         params![now],
     )?;
 
-    // One confirmed segment per eligible historical session (effective time
-    // = focused_seconds; project/category snapshots best-effort from the
-    // migrated task).
+    // R07/R08: one confirmed legacy record per eligible historical session.
+    // - Attribution comes from the session's OCCURRENCE-TIME project snapshot
+    //   (matched against the projects consolidated in this migration); the
+    //   task's CURRENT project must never rewrite history. Unmatched names
+    //   stay unmapped (project_id NULL, name preserved).
+    // - Old sessions have no pause ledger: the accurate fact is the TOTAL
+    //   (focused_seconds × 1000). started/ended are kept as metadata only and
+    //   the row is marked 'legacy_total_only' — it must never be treated as a
+    //   continuous effective interval.
     tx.execute(
         "INSERT INTO focus_segments (id, profile_id, session_id, task_id,
                                      project_id_snapshot, project_name_snapshot, category_id_snapshot,
-                                     effective_start_ms, effective_end_ms, effective_ms, state, created_at)
+                                     effective_start_ms, effective_end_ms, effective_ms, state,
+                                     temporal_precision, created_at)
          SELECT 'seg-' || hex(randomblob(8)), 'local', s.id, s.task_id,
-                t.project_id, s.project_snapshot,
-                (SELECT p.category_id FROM projects p WHERE p.id = t.project_id),
+                mp.project_id, s.project_snapshot, mp.category_id,
                 s.started_at, s.started_at + s.focused_seconds * 1000, s.focused_seconds * 1000,
-                'confirmed', s.ended_at
-         FROM sessions s LEFT JOIN tasks t ON t.id = s.task_id
+                'confirmed', 'legacy_total_only', s.ended_at
+         FROM sessions s
+         LEFT JOIN (SELECT p.id AS project_id, p.normalized_name, p.category_id
+                    FROM projects p WHERE p.profile_id = 'local') mp
+                ON mp.normalized_name = TRIM(s.project_snapshot)
          WHERE s.statistics_eligible = 1 AND s.focused_seconds > 0",
         [],
     )?;
@@ -1060,6 +1144,34 @@ mod tests {
             )
             .expect("segment");
         assert_eq!(seg, 1_200_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_failure_is_not_treated_as_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-openfail-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A DIRECTORY at the database path fails to open with an I/O error -
+        // not a corruption diagnosis. The path must be left completely alone.
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        std::fs::create_dir(&db_path).expect("create blocking directory");
+
+        let err = open_at(&db_path).expect_err("an unopenable path must fail");
+        assert_ne!(err.code, crate::error::ErrorCode::DatabaseTooNew);
+        assert!(db_path.is_dir(), "the blocking path must not be renamed aside");
+        let sidecars = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(sidecars, 0, "no corruption rename may happen on open errors");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1483,4 +1595,51 @@ mod tests {
         );
         eprintln!("[drill] upgraded copy preserved at {} for inspection", dir.display());
     }
+}
+
+/// Reads `user_version` from a THROWAWAY COPY of the {db, -wal, -shm} set so
+/// the check sees committed WAL pages without opening the source for writing.
+/// Returns `Ok(None)` when the source does not exist (fresh install).
+fn probe_schema_version(path: &Path) -> Result<Option<u32>, CommandError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("abyssal-probe-{ts}"));
+    std::fs::create_dir_all(&tmp).map_err(|err| {
+        CommandError::internal(format!("probe: cannot create temp dir: {err}"))
+    })?;
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if base.is_empty() {
+        return Err(CommandError::internal("probe: database path has no file name"));
+    }
+    let mut copied_main = false;
+    for name in [base.clone(), format!("{base}-wal"), format!("{base}-shm")] {
+        let src = path.with_file_name(&name);
+        if src.exists() {
+            std::fs::copy(&src, tmp.join(&name)).map_err(|err| {
+                CommandError::internal(format!("probe: cannot copy {name}: {err}"))
+            })?;
+            if name == base {
+                copied_main = true;
+            }
+        }
+    }
+    if !copied_main {
+        return Err(CommandError::internal("probe: main database file missing"));
+    }
+    let result = Connection::open(tmp.join(&base))
+        .map_err(CommandError::from)
+        .and_then(|conn| schema_version(&conn))
+        .map(Some);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result.map_err(|err| {
+        CommandError::database(format!("probe: source database unreadable on the copy: {err}"))
+    })
 }

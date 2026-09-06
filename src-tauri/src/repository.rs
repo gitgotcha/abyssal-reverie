@@ -880,7 +880,7 @@ pub fn get_timer(conn: &Connection) -> Result<TimerSnapshot, CommandError> {
 pub fn list_sessions(conn: &Connection, limit: i64) -> Result<Vec<TimerSession>, CommandError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {SESSION_COLUMNS} FROM sessions WHERE statistics_eligible = 1
-         ORDER BY started_at DESC, rowid DESC LIMIT ?1"
+         ORDER BY started_at DESC, id DESC LIMIT ?1"
     ))?;
     let rows = stmt.query_map(params![limit], session_from_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1748,6 +1748,20 @@ pub fn resume_timer(
     }
 
     let now = now_millis();
+    // R01 (PLAN-120 §4.2): resume continues with the CURRENT binding, but a
+    // task completed/archived while the round was paused must not be
+    // resurrected — unbind it and continue as an unbound round.
+    if let Some(id) = &timer.selected_task_id {
+        let stale = match get_task(&tx, id) {
+            Ok(task) => task.done || task.status == "archived",
+            Err(_) => true,
+        };
+        if stale {
+            timer.selected_task_id = None;
+            timer.task_title_snapshot = Some(NO_TASK_TITLE.to_owned());
+            timer.project_snapshot = Some(NO_TASK_PROJECT.to_owned());
+        }
+    }
     timer.state = TimerState::Running;
     timer.target_end_at = Some(now + timer.remaining_seconds * 1000);
     timer.paused_at = None;
@@ -1907,10 +1921,13 @@ pub fn switch_timer_task(
     let now = now_millis();
     let session_id = timer.active_session_id.clone().expect("session id");
 
-    // Close task A's open segment (keeps its effective time under A) and
-    // open task B's ledger. Both are pending until the session finalizes.
-    close_open_segment(&tx, &session_id, now)?;
-    open_segment(&tx, &session_id, Some(&new_task), now)?;
+    // R01 (PLAN-120 §4.2): a RUNNING switch closes A's open segment and opens
+    // B's ledger in the same transaction. A PAUSED switch only rebinds — no
+    // segments may start while the clock is frozen.
+    if timer.state == TimerState::Running {
+        close_open_segment(&tx, &session_id, now)?;
+        open_segment(&tx, &session_id, Some(&new_task), now)?;
+    }
 
     // Update the round's snapshots — the clock itself never moves.
     timer.selected_task_id = Some(new_task.id.clone());
@@ -2343,6 +2360,13 @@ pub fn persist_running_as_paused(conn: &Connection) -> Result<(), CommandError> 
     timer.revision += 1;
     timer.updated_at = now;
     write_timer(conn, &timer)?;
+    // R01: sealing the open segment keeps the ledger consistent with the
+    // frozen remaining time - no phantom open segment survives the quit.
+    if timer.mode == TimerMode::Focus {
+        if let Some(session_id) = &timer.active_session_id {
+            close_open_segment(conn, session_id, now)?;
+        }
+    }
     // Force the WAL into the main db file before the process exits so the
     // paused state is durable across `app.exit(0)`.
     let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
@@ -2367,11 +2391,14 @@ pub fn list_sessions_query(
         sql.push_str(" AND started_at >= ?");
         bindings.push(from);
     }
+    // R04 (P112-05): the query range is half-open [from, to) — the same rule
+    // get_statistics follows, so listings can never disagree with statistics.
     if let Some(to) = query.to {
-        sql.push_str(" AND started_at <= ?");
+        sql.push_str(" AND started_at < ?");
         bindings.push(to);
     }
-    sql.push_str(" ORDER BY started_at DESC, rowid DESC");
+    // R03: stable public ordering by (started_at DESC, id DESC) — never rowid.
+    sql.push_str(" ORDER BY started_at DESC, id DESC");
     if let Some(limit) = query.limit {
         sql.push_str(" LIMIT ?");
         bindings.push(limit);
@@ -2389,7 +2416,29 @@ pub fn list_sessions_query(
 /// - each segment from < to
 /// - each segment must fall within the total [from, to] range
 fn validate_day_boundaries(query: &StatisticsQuery) -> Result<(), CommandError> {
+    if query.from >= query.to {
+        return Err(CommandError::validation("statistics range must satisfy from < to"));
+    }
     let days = &query.days;
+    // R04 (P112-05): the day buckets used for total reconciliation must cover
+    // [from, to) contiguously — gaps or short coverage would let the total and
+    // the bucket sum disagree.
+    if !days.is_empty() {
+        let first = &days[0];
+        if first.from != query.from {
+            return Err(CommandError::validation(format!(
+                "day buckets must start at the range start ({} != {})",
+                first.from, query.from
+            )));
+        }
+        let last = &days[days.len() - 1];
+        if last.to != query.to {
+            return Err(CommandError::validation(format!(
+                "day buckets must end at the range end ({} != {})",
+                last.to, query.to
+            )));
+        }
+    }
     for (i, d) in days.iter().enumerate() {
         if d.from >= d.to {
             return Err(CommandError::validation(format!(
@@ -2455,18 +2504,27 @@ pub fn get_statistics(
     let focus_session_count = sessions.len() as i64;
     let focus_seconds: i64 = sessions.iter().map(|s| s.focused_seconds).sum();
 
-    // v1.2 D: per-project / per-category attribution comes from the SEGMENT
-    // ledger — after a same-clock switch one session may span several tasks,
-    // and each keeps its own effective time. Sessions without segments
-    // (defensive) fall back to their own frozen snapshots.
+    // v1.2 D + R12: per-project / per-category attribution comes from the
+    // SEGMENT ledger, grouped by the STABLE project/category ID when one is
+    // known — a rename must never split one project into several buckets.
+    // Segments without a resolvable ID (unmapped history) keep their name
+    // snapshot in a separate "unmapped:" group; display names resolve to the
+    // CURRENT entity name. Sessions without segments (defensive) fall back to
+    // their own frozen snapshots.
     let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seg_project: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
-    let mut seg_category: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    // key -> (display_name, sessions, ms)
+    let mut seg_project: std::collections::BTreeMap<String, (String, i64, i64)> = std::collections::BTreeMap::new();
+    let mut seg_category: std::collections::BTreeMap<String, (String, i64, i64)> = std::collections::BTreeMap::new();
     {
         let mut seg_stmt = conn.prepare(
-            "SELECT seg.session_id, seg.effective_ms, seg.project_name_snapshot, seg.category_name_snapshot
+            "SELECT seg.session_id, seg.effective_ms,
+                    seg.project_id_snapshot, seg.project_name_snapshot,
+                    seg.category_id_snapshot, seg.category_name_snapshot,
+                    p.name, c.name
              FROM focus_segments seg
              JOIN sessions s ON s.id = seg.session_id
+             LEFT JOIN projects p ON p.id = seg.project_id_snapshot
+             LEFT JOIN categories c ON c.id = seg.category_id_snapshot
              WHERE s.mode = 'focus' AND s.status = 'completed' AND s.statistics_eligible = 1
                AND s.started_at >= ?1 AND s.started_at < ?2 AND seg.state = 'confirmed'",
         )?;
@@ -2474,20 +2532,42 @@ pub fn get_statistics(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         for r in rows {
-            let (sid, ms, project, category) = r?;
+            let (sid, ms, project_id, project_name, category_id, category_name, p_now, c_now) = r?;
             covered.insert(sid);
-            let pe = seg_project.entry(project).or_insert((0, 0));
-            pe.0 += 1;
-            pe.1 += ms;
-            let cat = if category.is_empty() { "未分类".to_owned() } else { category };
-            let ce = seg_category.entry(cat).or_insert((0, 0));
-            ce.0 += 1;
-            ce.1 += ms;
+            // R12: stable-ID key when the snapshot resolves; otherwise the
+            // name snapshot lives under an "unmapped:" pseudo-key.
+            let (project_key, project_label) = match (&project_id, &p_now) {
+                (Some(id), Some(name)) => (format!("pid:{id}"), name.clone()),
+                (Some(id), None) => (format!("pid:{id}"), project_name.clone()),
+                (None, _) => (format!("unmapped:{project_name}"), project_name.clone()),
+            };
+            let pe = seg_project.entry(project_key).or_insert((project_label, 0, 0));
+            pe.1 += 1;
+            pe.2 += ms;
+            let category_label = match (&category_id, &c_now) {
+                // Current category name wins when the stable ID resolves.
+                (_, Some(name)) => name.clone(),
+                (None, _) if category_name.is_empty() => "未分类".to_owned(),
+                (None, _) => category_name.clone(),
+                // ID present but the category row vanished: keep the snapshot.
+                (Some(_), None) => category_name.clone(),
+            };
+            let category_key = match &category_id {
+                Some(id) => format!("cid:{id}"),
+                None => format!("cname:{category_label}"),
+            };
+            let ce = seg_category.entry(category_key).or_insert((category_label, 0, 0));
+            ce.1 += 1;
+            ce.2 += ms;
         }
     }
 
@@ -2523,16 +2603,20 @@ pub fn get_statistics(
         if covered.contains(&s.id) {
             continue;
         }
-        let entry = by_project_map.entry(s.project_snapshot.clone()).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += s.focused_seconds;
+        let entry = by_project_map
+            .entry(format!("unmapped:{}", s.project_snapshot))
+            .or_insert((s.project_snapshot.clone(), 0, 0));
+        entry.1 += 1;
+        // The segment map accumulates MILLISECONDS; session fallback carries
+        // SECONDS — convert at the boundary (R03 unit rule).
+        entry.2 += s.focused_seconds * 1000;
     }
     let by_project: Vec<ProjectStat> = by_project_map
         .iter()
-        .map(|(project, (sessions, seconds))| ProjectStat {
-            project: project.clone(),
+        .map(|(_, (name, sessions, ms))| ProjectStat {
+            project: name.clone(),
             sessions: *sessions,
-            focus_seconds: *seconds,
+            focus_seconds: ms / 1000,
         })
         .collect();
 
@@ -2569,8 +2653,8 @@ pub fn get_statistics(
 
     let by_category: Vec<ProjectStat> = seg_category
         .iter()
-        .map(|(category, (sessions, ms))| ProjectStat {
-            project: category.clone(),
+        .map(|(_, (name, sessions, ms))| ProjectStat {
+            project: name.clone(),
             sessions: *sessions,
             focus_seconds: ms / 1000,
         })
@@ -2625,12 +2709,18 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
     )?;
 
+    // R12: all-time by_project also aggregates by stable project ID (falling
+    // back to the frozen name for unmapped history), so a rename never splits
+    // one project's totals.
     let mut stmt = conn.prepare(
-        "SELECT project_snapshot, COUNT(*) AS sessions, COALESCE(SUM(focused_seconds), 0) AS focus_seconds
-         FROM sessions
-         WHERE mode = 'focus' AND status = 'completed' AND statistics_eligible = 1
-         GROUP BY project_snapshot
-         ORDER BY focus_seconds DESC, project_snapshot ASC",
+        "SELECT COALESCE(p.name, s.project_snapshot) AS label,
+                COUNT(*) AS sessions, COALESCE(SUM(s.focused_seconds), 0) AS focus_seconds
+         FROM sessions s
+         LEFT JOIN tasks t ON t.id = s.task_id
+         LEFT JOIN projects p ON p.id = t.project_id
+         WHERE s.mode = 'focus' AND s.status = 'completed' AND s.statistics_eligible = 1
+         GROUP BY COALESCE(t.project_id, 'unmapped:' || s.project_snapshot)
+         ORDER BY focus_seconds DESC, label ASC",
     )?;
     let by_project = stmt
         .query_map([], |row| {
@@ -2649,6 +2739,7 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
          WHERE mode = 'focus' AND status = 'completed' AND statistics_eligible = 1
          GROUP BY tag ORDER BY focus_seconds DESC, tag ASC",
     )?;
+    let _ = &by_tag_stmt;
     let by_tag = by_tag_stmt
         .query_map([], |row| {
             Ok(ProjectStat {
@@ -2660,9 +2751,13 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut cat_stmt = conn.prepare(
-        "SELECT CASE WHEN category_name_snapshot = '' THEN '未分类' ELSE category_name_snapshot END AS cat,
-                COUNT(*) AS segments, COALESCE(SUM(effective_ms), 0) AS ms
-         FROM focus_segments WHERE state = 'confirmed'
+        "SELECT COALESCE(c.name,
+                        CASE WHEN seg.category_name_snapshot = '' THEN '未分类'
+                             ELSE 'unmapped:' || seg.category_name_snapshot END) AS cat,
+                COUNT(*) AS segments, COALESCE(SUM(seg.effective_ms), 0) AS ms
+         FROM focus_segments seg
+         LEFT JOIN categories c ON c.id = seg.category_id_snapshot
+         WHERE seg.state = 'confirmed'
          GROUP BY cat ORDER BY ms DESC, cat ASC",
     )?;
     let by_category = cat_stmt
