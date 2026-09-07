@@ -6,8 +6,8 @@ use crate::models::{
     AppSettings, CompleteTimerInput, CompleteTimerResult, CreateTagInput, CreateTaskInput, DayStat,
     BackupHeader, DeleteTagResult, ExportBundle, ExportBundleV1, FinishTimerInput,
     FinishTimerResult, ImportPreview, ImportSummary, ProjectStat,
-    SaveSettingsResult, SessionQuery, SessionStatus, SessionV1, StartTimerInput, Statistics,
-    StatisticsQuery, SwitchTimerModeInput, SwitchTimerTaskInput, SwitchTimerTaskResult,
+    SaveSettingsResult, SessionQuery, SessionStatus, StartTimerInput,
+    Statistics, StatisticsQuery, SwitchTimerModeInput, SwitchTimerTaskInput, SwitchTimerTaskResult,
     CompleteTaskInput, CompleteTaskResult, TaskProgress, Category, CreateCategoryInput,
     UpdateCategoryInput, Project, CreateProjectInput, UpdateProjectInput, Tag,
     TagDeletePreview, TagKind, Task, TaskPriority,
@@ -20,6 +20,13 @@ pub const NO_TASK_PROJECT: &str = "通用";
 pub const SHORT_BREAK_TITLE: &str = "短休";
 pub const LONG_BREAK_TITLE: &str = "长休";
 pub const BREAK_PROJECT: &str = "休息";
+
+/// v5: frozen display snapshot for rounds whose task carries NO tag (Codex
+/// 复审阻断 2). The session keeps `tag_id = NULL`; statistics bucket these
+/// rounds under this non-affiliation label instead of silently crediting
+/// them to 「其他」. Rounds with NO task at all (breaks / free focus) keep
+/// the historical fallback snapshot.
+pub const NO_TAG_SNAPSHOT: &str = "无标签";
 
 pub const MIN_POMODORO_TARGET: i64 = 1;
 pub const MAX_POMODORO_TARGET: i64 = 99;
@@ -43,7 +50,8 @@ pub const EXPORT_SCHEMA_VERSION: u32 = 2;
 
 const TASK_COLUMNS: &str = "id, title, done, pomodoro_target, priority, project, project_id, \
                             target_seconds, budget_source, status, deadline, notes, tag_id, \
-                            sort_order, created_at, updated_at, completed_at";
+                            sort_order, created_at, updated_at, completed_at, \
+                            relationship_revision";
 const SESSION_COLUMNS: &str = "id, task_id, task_title_snapshot, project_snapshot, tag_id, \
                                tag_name_snapshot, mode, status, planned_seconds, focused_seconds, \
                                started_at, ended_at, finish_reason, statistics_eligible, \
@@ -105,13 +113,13 @@ pub fn validate_pomodoro_target(target: i64) -> Result<(), CommandError> {
 // ─── Row mapping ─────────────────────────────────────────────────────────────
 
 fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
-    let priority_text: String = row.get("priority")?;
+    let priority_text: Option<String> = row.get("priority")?;
     Ok(Task {
         id: row.get("id")?,
         title: row.get("title")?,
         done: row.get::<_, i64>("done")? != 0,
         pomodoro_target: row.get("pomodoro_target")?,
-        priority: TaskPriority::parse_str(&priority_text).unwrap_or(TaskPriority::Med),
+        priority: priority_text.map(|t| TaskPriority::parse_str(&t).unwrap_or(TaskPriority::Med)),
         project: row.get("project")?,
         project_id: row.get("project_id")?,
         target_seconds: row.get("target_seconds")?,
@@ -124,6 +132,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
+        relationship_revision: row.get("relationship_revision")?,
     })
 }
 
@@ -260,10 +269,11 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
     let sort_order: i64 = conn
         .query_row("SELECT COALESCE(MAX(sort_order) + 1, 0) FROM tasks", [], |row| row.get(0))
         .unwrap_or(0);
-    // F4 lets the user pick the tag; empty/legacy callers land on the
-    // fallback tag.
-    let (fallback_id, _fallback_name) = fallback_tag(conn)?;
-    let tag_id = if input.tag_id.is_empty() { fallback_id } else { input.tag_id.clone() };
+    // v5: 未选择 = NULL. Title-only creation no longer lands on the fallback
+    // tag; an explicitly provided id is used verbatim (and FK-validated by
+    // the schema's RESTRICT).
+    let tag_id: Option<String> =
+        input.tag_id.as_deref().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned);
 
     // v1.2: resolve the owning project (display name comes from the project
     // row) and freeze the budget at creation time from the CURRENT settings.
@@ -298,6 +308,7 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
         created_at: now,
         updated_at: now,
         completed_at: None,
+        relationship_revision: 0,
     };
 
     conn.execute(
@@ -310,7 +321,7 @@ pub fn insert_task(conn: &Connection, input: &CreateTaskInput) -> Result<Task, C
             task.title,
             task.done as i64,
             task.pomodoro_target,
-            task.priority.as_str(),
+            task.priority.as_ref().map(|p| p.as_str()),
             task.project,
             task.project_id,
             task.target_seconds,
@@ -348,7 +359,7 @@ pub fn update_task(conn: &Connection, input: &UpdateTaskInput) -> Result<Task, C
         task.pomodoro_target = target;
     }
     if let Some(priority) = input.priority {
-        task.priority = priority;
+        task.priority = Some(priority);
     }
 
     // v1.2: project moves. Empty string detaches (standalone); a real id must
@@ -431,7 +442,7 @@ pub fn update_task(conn: &Connection, input: &UpdateTaskInput) -> Result<Task, C
             task.title,
             task.done as i64,
             task.pomodoro_target,
-            task.priority.as_str(),
+            task.priority.as_ref().map(|p| p.as_str()),
             task.project,
             task.project_id,
             task.target_seconds,
@@ -453,6 +464,97 @@ pub fn update_task(conn: &Connection, input: &UpdateTaskInput) -> Result<Task, C
         )?;
     }
 
+    Ok(task)
+}
+
+/// v1.4 (batch 1): atomic task-relationship change with an optimistic
+/// revision guard. `Keep` leaves a field untouched; `Clear` NULLs it; `Set`
+/// validates the referenced entity (existence + active status for projects)
+/// before applying. The revision increments ONLY here — title/budget edits
+/// never bump it — so a stale `expectedRevision` always means a genuine
+/// concurrent relationship change and returns a CONFLICT the caller can
+/// surface ("reload and retry"). The whole patch applies in one transaction.
+pub fn apply_relationship_patch(
+    conn: &mut Connection,
+    patch: &crate::models::RelationshipPatch,
+) -> Result<Task, CommandError> {
+    let tx = conn.transaction()?;
+    let current = get_task(&tx, &patch.task_id)?;
+
+    // Concurrency guard FIRST: a stale revision is rejected even when the
+    // patch would resolve to a no-op — the caller's view is outdated either
+    // way, and silently accepting it would hide the lost-update.
+    if current.relationship_revision != patch.expected_revision {
+        return Err(CommandError::conflict(format!(
+            "任务关联已被其他修改更新（当前修订号 {}，提交时为 {}）；请刷新后重试",
+            current.relationship_revision, patch.expected_revision
+        )));
+    }
+
+    // Resolve each patch to its TARGET value, validating referenced entities
+    // on the way. Change detection then compares resolved values against the
+    // stored ones — never the patch variant itself (Codex 复审阻断 1).
+    let (new_project_id, new_project_name) = match &patch.project {
+        crate::models::NullablePatch::Keep => {
+            (current.project_id.clone(), current.project.clone())
+        }
+        crate::models::NullablePatch::Clear => (None, DEFAULT_PROJECT.to_owned()),
+        crate::models::NullablePatch::Set { value } => {
+            let project = get_project(&tx, value)?;
+            if project.status != "active" {
+                return Err(CommandError::validation(format!(
+                    "项目“{}”已{}，无法关联任务",
+                    project.name,
+                    if project.status == "archived" { "归档" } else { "完成" }
+                )));
+            }
+            (Some(project.id.clone()), project.name)
+        }
+    };
+    let new_tag_id = match &patch.tag {
+        crate::models::NullablePatch::Keep => current.tag_id.clone(),
+        crate::models::NullablePatch::Clear => None,
+        crate::models::NullablePatch::Set { value } => {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM tags WHERE id = ?1",
+                params![value],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Err(CommandError::not_found(format!("标签 {value} 不存在")));
+            }
+            Some(value.clone())
+        }
+    };
+
+    // Bump ONLY when a stored value actually changes: Keep+Keep, clearing an
+    // already-NULL field and re-setting the currently-held id are all no-ops.
+    let changed = new_project_id != current.project_id || new_tag_id != current.tag_id;
+
+    let mut task = current;
+    if changed {
+        task.project_id = new_project_id;
+        task.project = new_project_name;
+        task.tag_id = new_tag_id;
+        task.relationship_revision += 1;
+        task.updated_at = now_millis();
+
+        tx.execute(
+            "UPDATE tasks SET project = ?1, project_id = ?2, tag_id = ?3,
+                              relationship_revision = ?4, updated_at = ?5
+             WHERE id = ?6",
+            params![
+                task.project,
+                task.project_id,
+                task.tag_id,
+                task.relationship_revision,
+                task.updated_at,
+                task.id,
+            ],
+        )?;
+    }
+
+    tx.commit()?;
     Ok(task)
 }
 
@@ -1552,18 +1654,19 @@ fn write_finished_session(
     } else {
         "too_short"
     };
-    let (fallback_id, fallback_name) = fallback_tag(conn)?;
     let session = TimerSession {
         id: session_id,
         task_id: timer.selected_task_id.clone(),
         task_title_snapshot: timer.task_title_snapshot.clone().unwrap_or_default(),
         project_snapshot: timer.project_snapshot.clone().unwrap_or_default(),
-        tag_id: Some(timer.tag_id.clone().unwrap_or_else(|| fallback_id.clone())),
+        // v5 (Codex 复审阻断 2): trust the round snapshot — a tagless task's
+        // round persists tag_id = NULL (no implicit fallback rebinding).
+        tag_id: timer.tag_id.clone(),
         tag_name_snapshot: Some(
             timer
                 .tag_name_snapshot
                 .clone()
-                .unwrap_or_else(|| fallback_name.clone()),
+                .unwrap_or_else(|| NO_TAG_SNAPSHOT.to_owned()),
         ),
         mode: timer.mode,
         status,
@@ -1649,19 +1752,29 @@ pub fn start_timer(
     };
     let (title_snap, project_snap) = snapshot_for_mode(input.mode, task.as_ref());
     // v1.1: freeze the tag alongside title/project. A selected task donates
-    // its tag; breaks and no-task rounds use the fallback tag. Mid-run tag
-    // changes never alter this snapshot.
+    // its tag; a v5 TAGLESS task stays tagless end-to-end (Codex 复审阻断 2) —
+    // the round snapshot carries NO_TAG_SNAPSHOT and no tag id, so statistics
+    // never credit it to 「其他」. No-task rounds and breaks keep the
+    // historical fallback snapshot (explicit branch below).
     let (tag_id, tag_name) = match (&input.selected_task_id, input.mode) {
         (Some(_), TimerMode::Focus) => {
             let task = task.as_ref().expect("task resolved above");
-            let name: String = tx.query_row(
-                "SELECT name FROM tags WHERE id = ?1",
-                params![task.tag_id],
-                |row| row.get(0),
-            )?;
-            (task.tag_id.clone(), name)
+            match &task.tag_id {
+                Some(tid) => {
+                    let name: String = tx.query_row(
+                        "SELECT name FROM tags WHERE id = ?1",
+                        params![tid],
+                        |row| row.get(0),
+                    )?;
+                    (Some(tid.clone()), name)
+                }
+                None => (None, NO_TAG_SNAPSHOT.to_owned()),
+            }
         }
-        _ => fallback_tag(&tx)?,
+        _ => {
+            let (id, name) = fallback_tag(&tx)?;
+            (Some(id), name)
+        }
     };
     let duration = settings.duration_seconds_for_mode(input.mode);
     let now = now_millis();
@@ -1673,7 +1786,7 @@ pub fn start_timer(
     timer.selected_task_id = input.selected_task_id.clone();
     timer.task_title_snapshot = Some(title_snap);
     timer.project_snapshot = Some(project_snap);
-    timer.tag_id = Some(tag_id);
+    timer.tag_id = tag_id;
     timer.tag_name_snapshot = Some(tag_name);
     timer.duration_seconds = duration;
     timer.remaining_seconds = duration;
@@ -1933,13 +2046,23 @@ pub fn switch_timer_task(
     timer.selected_task_id = Some(new_task.id.clone());
     timer.task_title_snapshot = Some(new_task.title.clone());
     timer.project_snapshot = Some(new_task.project.clone());
-    let tag_name: String = tx.query_row(
-        "SELECT name FROM tags WHERE id = ?1",
-        params![new_task.tag_id],
-        |row| row.get(0),
-    )?;
-    timer.tag_id = Some(new_task.tag_id.clone());
-    timer.tag_name_snapshot = Some(tag_name);
+    // v5 (Codex 复审阻断 2): a tagless target task keeps the round tagless —
+    // NO fallback rebinding. Explicitly chosen tags persist verbatim.
+    match &new_task.tag_id {
+        Some(tid) => {
+            let tag_name: String = tx.query_row(
+                "SELECT name FROM tags WHERE id = ?1",
+                params![tid],
+                |row| row.get(0),
+            )?;
+            timer.tag_id = Some(tid.clone());
+            timer.tag_name_snapshot = Some(tag_name);
+        }
+        None => {
+            timer.tag_id = None;
+            timer.tag_name_snapshot = Some(NO_TAG_SNAPSHOT.to_owned());
+        }
+    }
     timer.revision += 1;
     timer.updated_at = now;
     write_timer(&tx, &timer)?;
@@ -2049,7 +2172,6 @@ pub fn complete_timer(
     } else {
         "too_short"
     };
-    let (fallback_id, fallback_name) = fallback_tag(&tx)?;
 
     // v1.2 B1: close the open segment and settle the ledger — confirmed when
     // the session qualifies, voided when it does not (sub-30s focus).
@@ -2069,12 +2191,14 @@ pub fn complete_timer(
         task_id: timer.selected_task_id.clone(),
         task_title_snapshot: timer.task_title_snapshot.clone().unwrap_or_else(|| NO_TASK_TITLE.to_owned()),
         project_snapshot: timer.project_snapshot.clone().unwrap_or_else(|| NO_TASK_PROJECT.to_owned()),
-        tag_id: Some(timer.tag_id.clone().unwrap_or_else(|| fallback_id.clone())),
+        // v5 (Codex 复审阻断 2): trust the round snapshot — a tagless task's
+        // round persists tag_id = NULL (no implicit fallback rebinding).
+        tag_id: timer.tag_id.clone(),
         tag_name_snapshot: Some(
             timer
                 .tag_name_snapshot
                 .clone()
-                .unwrap_or_else(|| fallback_name.clone()),
+                .unwrap_or_else(|| NO_TAG_SNAPSHOT.to_owned()),
         ),
         mode: timer.mode,
         status: SessionStatus::Completed,
@@ -2224,7 +2348,6 @@ pub fn finish_timer(
     } else {
         "too_short"
     };
-    let (fallback_id, fallback_name) = fallback_tag(&tx)?;
 
     // v1.2 B1: settle the segment ledger with the session (manual finish
     // confirms a qualifying session's segments; too-short ones are voided).
@@ -2250,12 +2373,14 @@ pub fn finish_timer(
             .project_snapshot
             .clone()
             .unwrap_or_else(|| NO_TASK_PROJECT.to_owned()),
-        tag_id: Some(timer.tag_id.clone().unwrap_or_else(|| fallback_id.clone())),
+        // v5 (Codex 复审阻断 2): trust the round snapshot — a tagless task's
+        // round persists tag_id = NULL (no implicit fallback rebinding).
+        tag_id: timer.tag_id.clone(),
         tag_name_snapshot: Some(
             timer
                 .tag_name_snapshot
                 .clone()
-                .unwrap_or_else(|| fallback_name.clone()),
+                .unwrap_or_else(|| NO_TAG_SNAPSHOT.to_owned()),
         ),
         mode: timer.mode,
         status: SessionStatus::Completed,
@@ -2830,7 +2955,7 @@ fn normalize_v1_bundle(v1: ExportBundleV1) -> ExportBundle {
             title: t.title,
             done: t.done,
             pomodoro_target: t.pomodoro_target,
-            priority: t.priority,
+            priority: Some(t.priority),
             project: t.project,
             project_id: None,
             target_seconds: 0,
@@ -2838,11 +2963,12 @@ fn normalize_v1_bundle(v1: ExportBundleV1) -> ExportBundle {
             status: if t.done { "done".to_owned() } else { "todo".to_owned() },
             deadline: None,
             notes: String::new(),
-            tag_id: crate::models::FALLBACK_TAG_ID.to_owned(),
+            tag_id: Some(crate::models::FALLBACK_TAG_ID.to_owned()),
             sort_order: t.sort_order,
             created_at: t.created_at,
             updated_at: t.updated_at,
             completed_at: t.completed_at,
+            relationship_revision: 0,
         })
         .collect();
 
@@ -2956,7 +3082,10 @@ pub fn validate_import(bundle: &ExportBundle) -> Result<(), CommandError> {
             return Err(CommandError::validation("v2 备份必须有且只有一个保底标签"));
         }
         for task in &bundle.tasks {
-            if !bundle.tags.iter().any(|t| t.id == task.tag_id) {
+            // v5: a NULL tag references nothing — only Some(id) must resolve
+            // inside the bundle.
+            let Some(tag_id) = task.tag_id.as_deref() else { continue };
+            if !bundle.tags.iter().any(|t| t.id == tag_id) {
                 return Err(CommandError::validation(format!(
                     "任务“{}”引用了备份中不存在的标签",
                     task.title
@@ -3009,24 +3138,27 @@ pub fn import_data(conn: &mut Connection, bundle: &ExportBundle) -> Result<Impor
     }
 
     // Replace tasks (ids preserved from the backup; tag_id defaults to the
-    // fallback tag for v1 backups via the model's serde default).
+    // fallback tag for v1 backups via the model's serde default). v5 keeps
+    // NULL metadata and the relationship revision verbatim (round-trip fidelity).
     for task in &bundle.tasks {
         tx.execute(
             "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
-                                sort_order, created_at, updated_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                sort_order, created_at, updated_at, completed_at,
+                                relationship_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 task.id,
                 task.title,
                 task.done as i64,
                 task.pomodoro_target,
-                task.priority.as_str(),
+                task.priority.as_ref().map(|p| p.as_str()),
                 task.project,
                 task.tag_id,
                 task.sort_order,
                 task.created_at,
                 task.updated_at,
                 task.completed_at,
+                task.relationship_revision,
             ],
         )?;
     }
@@ -3162,16 +3294,16 @@ pub fn export_sessions_csv(conn: &Connection) -> Result<String, CommandError> {
 mod tests {
     use super::*;
     use crate::db;
-    use crate::models::StatisticsDayBoundary;
+    use crate::models::{NullablePatch, RelationshipPatch, StatisticsDayBoundary};
 
     fn create_input(title: &str) -> CreateTaskInput {
         CreateTaskInput {
             title: title.to_owned(),
             pomodoro_target: 4,
-            priority: TaskPriority::High,
+            priority: Some(TaskPriority::High),
             project: "Abyssal".to_owned(),
-            tag_id: String::new(),
-        
+            tag_id: None,
+
             ..Default::default()
         }
     }
@@ -3425,9 +3557,9 @@ mod tests {
         let task = insert_task(&conn, &CreateTaskInput {
             title: "学习二叉树".to_owned(),
             pomodoro_target: 2,
-            priority: TaskPriority::Med,
+            priority: Some(TaskPriority::Med),
             project: "通用".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             ..Default::default()
         })
         .expect("task");
@@ -3607,10 +3739,10 @@ mod tests {
             insert_task(&conn, &CreateTaskInput {
                 title: title.to_owned(),
                 pomodoro_target: 1,
-                priority: TaskPriority::Med,
+                priority: Some(TaskPriority::Med),
                 project_id: Some(project.id.clone()),
                 project: "通用".to_owned(),
-                tag_id: String::new(),
+                tag_id: None,
                 ..Default::default()
             })
             .expect("task");
@@ -3728,7 +3860,7 @@ mod tests {
 
         assert_eq!(stored.title, "Write the migration");
         assert_eq!(stored.pomodoro_target, 4);
-        assert_eq!(stored.priority, TaskPriority::High);
+        assert_eq!(stored.priority, Some(TaskPriority::High));
         assert_eq!(stored.project, "Abyssal");
         assert!(!stored.done);
         assert_eq!(stored.completed_at, None);
@@ -3803,7 +3935,7 @@ mod tests {
         .expect("update");
 
         assert_eq!(updated.title, "Renamed");
-        assert_eq!(updated.priority, TaskPriority::Low);
+        assert_eq!(updated.priority, Some(TaskPriority::Low));
         assert_eq!(updated.pomodoro_target, 4, "untouched fields must persist");
         assert_eq!(updated.project, "Abyssal");
     }
@@ -4103,9 +4235,9 @@ mod tests {
             insert_task(&conn, &CreateTaskInput {
                 title: format!("任务{i}"),
                 pomodoro_target: 1,
-                priority: TaskPriority::Med,
+                priority: Some(TaskPriority::Med),
                 project: "通用".to_owned(),
-                tag_id: String::new(),
+                tag_id: None,
                 ..Default::default()
             })
             .expect("task");
@@ -4129,9 +4261,9 @@ mod tests {
         // A task on the tag + a session whose snapshot froze that tag name.
         insert_task(&conn, &CreateTaskInput {
             title: "会转移的任务".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             pomodoro_target: 1,
-            priority: TaskPriority::Med,
+            priority: Some(TaskPriority::Med),
             project: "通用".to_owned(),
         
             ..Default::default()
@@ -4156,7 +4288,7 @@ mod tests {
 
         // Task moved to the fallback tag.
         let tasks = list_tasks(&conn).expect("tasks");
-        assert_eq!(tasks[0].tag_id, result.fallback_tag_id);
+        assert_eq!(tasks[0].tag_id.as_deref(), Some(result.fallback_tag_id.as_str()));
 
         // Historical session keeps its frozen snapshot; the stable id is nulled.
         let snapshot: Option<String> = conn
@@ -4189,12 +4321,569 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0)).expect("count")
     }
 
+    // v5 语义反转：原 new_tasks_default_to_fallback_tag 断言的旧行为（空标签自动
+    // 落 fallback）已随批次 0 红灯证据归档，不再存在；显式选择路径由本用例守护。
     #[test]
-    fn new_tasks_default_to_fallback_tag() {
+    fn explicit_tag_is_respected_on_create() {
         let conn = db::open_in_memory().expect("db");
-        let task = insert_task(&conn, &create_input("默认标签任务")).expect("task");
-        let fallback = list_tags(&conn).expect("list").into_iter().find(|t| t.is_fallback).unwrap();
-        assert_eq!(task.tag_id, fallback.id);
+        let work = list_tags(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|t| t.id == "system-work")
+            .expect("work tag");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some(work.id.clone()), ..create_input("显式标签任务") },
+        )
+        .expect("task");
+        assert_eq!(task.tag_id.as_deref(), Some(work.id.as_str()));
+    }
+
+    // ─── 批次 1.1：可空元数据（schema v5）——1.2/1.6 完成后已全部转绿 ──────────
+    // 历史红灯（4 条：无自动填 / 库内 NULL tag / 表可空 ×2）捕获于批次 0 后段，
+    // 输出证据见 docs/superpowers/plans/evidence/2026-09-07-batch1/。转绿路径：
+    // 1.2 重建 tasks 表（可空性）+ 1.6 契约改造（CreateTaskInput Option 化）。
+    // 断言独立成测（Codex 复核教训：串联断言会被前一个失败遮蔽）。
+
+    #[test]
+    fn title_only_task_gets_no_fallback_tag() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("标题-only 任务")).expect("task");
+        // ✅ v5：未选择标签 = 不自动填任何标签（原 L266 自动填已移除）。
+        assert_eq!(task.tag_id, None, "title-only creation must not auto-fill a tag");
+    }
+
+    #[test]
+    fn title_only_task_persists_null_tag_in_db() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("标题-only 任务")).expect("task");
+        let stored: Option<String> = conn
+            .query_row("SELECT tag_id FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("query tag_id");
+        // ✅ v5：库内 tag_id 为 NULL。
+        assert_eq!(stored, None, "tag_id should persist as NULL for title-only creation");
+    }
+
+    #[test]
+    fn title_only_task_persists_null_priority_in_db() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { priority: None, ..create_input("未选优先级任务") },
+        )
+        .expect("task");
+        let stored: Option<String> = conn
+            .query_row("SELECT priority FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("query priority");
+        // ✅ v5：未选择优先级落 NULL（不再有 DEFAULT 'med' 兜底）。
+        assert_eq!(stored, None, "priority should persist as NULL when not picked");
+    }
+
+    #[test]
+    fn tasks_table_allows_null_tag_id() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("任意任务")).expect("task");
+        // ✅ v5：tasks.tag_id 可空。
+        let result = conn.execute("UPDATE tasks SET tag_id = NULL WHERE id = ?1", params![task.id]);
+        assert!(result.is_ok(), "v5 tasks.tag_id must be nullable; got {:?}", result.err());
+    }
+
+    #[test]
+    fn tasks_table_allows_null_priority() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("任意任务")).expect("task");
+        // ✅ v5：tasks.priority 可空（DEFAULT 'med' 已随重建移除）。
+        let result = conn.execute("UPDATE tasks SET priority = NULL WHERE id = ?1", params![task.id]);
+        assert!(result.is_ok(), "v5 tasks.priority must be nullable; got {:?}", result.err());
+    }
+
+    // ─── 批次 1.6：RelationshipPatch（修订号守卫 + 显式清空/设置）──────────────
+
+    #[test]
+    fn relationship_patch_clears_tag_and_project() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("要清空的任务") },
+        )
+        .expect("task");
+        assert!(task.tag_id.is_some() && task.project_id.is_some());
+
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Clear,
+                tag: NullablePatch::Clear,
+            },
+        )
+        .expect("patch");
+        assert_eq!(updated.tag_id, None, "explicit clear must NULL the tag");
+        assert_eq!(updated.project_id, None, "explicit clear must detach the project");
+        assert_eq!(updated.project, "通用", "detached tasks show the standalone project");
+        assert_eq!(updated.relationship_revision, task.relationship_revision + 1);
+    }
+
+    #[test]
+    fn relationship_patch_set_validates_entities() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("关联任务")).expect("task");
+        let work = list_tags(&conn)
+            .expect("tags")
+            .into_iter()
+            .find(|t| t.id == "system-work")
+            .expect("work tag");
+
+        // Unknown tag → NotFound.
+        let missing = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Set { value: "tag-does-not-exist".to_owned() },
+            },
+        );
+        assert!(matches!(missing, Err(ref e) if e.code == crate::error::ErrorCode::NotFound));
+
+        // Valid tag → applied and revision bumped.
+        let tagged = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Set { value: work.id.clone() },
+            },
+        )
+        .expect("patch");
+        assert_eq!(tagged.tag_id.as_deref(), Some(work.id.as_str()));
+        assert_eq!(tagged.relationship_revision, task.relationship_revision + 1);
+    }
+
+    #[test]
+    fn relationship_patch_rejects_stale_revision() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("并发任务") },
+        )
+        .expect("task");
+        let stale = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision + 5,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Clear,
+            },
+        );
+        assert!(
+            matches!(stale, Err(ref e) if e.code == crate::error::ErrorCode::Conflict),
+            "a stale expectedRevision must surface as a CONFLICT, not a silent overwrite"
+        );
+        // Nothing changed.
+        let stored = get_task(&conn, &task.id).expect("task");
+        assert_eq!(stored.relationship_revision, task.relationship_revision);
+        assert!(stored.tag_id.is_some());
+    }
+
+    #[test]
+    fn relationship_patch_stale_revision_rejected_even_if_equivalent() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("并发等价") },
+        )
+        .expect("task");
+        // Stale revision + a patch that would resolve to a no-op: the caller's
+        // view is outdated regardless — the concurrency guard fires first.
+        let stale = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision + 1,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Keep,
+            },
+        );
+        assert!(
+            matches!(stale, Err(ref e) if e.code == crate::error::ErrorCode::Conflict),
+            "an equivalent patch with a stale revision is still a concurrency loss"
+        );
+        let stored = get_task(&conn, &task.id).expect("task");
+        assert_eq!(stored.relationship_revision, task.relationship_revision);
+    }
+
+    #[test]
+    fn relationship_revision_ignores_plain_task_edits() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("普通编辑")).expect("task");
+        update_task(
+            &conn,
+            &UpdateTaskInput {
+                id: task.id.clone(),
+                title: Some("改标题不影响修订号".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("update");
+        let stored = get_task(&conn, &task.id).expect("task");
+        assert_eq!(
+            stored.relationship_revision, task.relationship_revision,
+            "only apply_relationship_patch may bump the revision"
+        );
+    }
+
+    // ─── 批次 1 阻断修订（Codex 复审 2026-09-07）：三个契约缺口 ────────────────
+    // 缺口 1：修订号仅在实际关联变化时递增（Keep/等价补丁不动）。
+    // 缺口 2：无标签任务在计时链路保持 tag_id=NULL，不重绑「其他」。
+    // 缺口 3：迁移守恒按行级 (id, task_id) 对账（数量守恒不能证明指向不变）。
+
+    #[test]
+    fn relationship_patch_keep_keep_keeps_revision() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("保持不动")).expect("task");
+        let before = get_task(&conn, &task.id).expect("load");
+
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: before.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Keep,
+            },
+        )
+        .expect("patch");
+        // 🔴 修复前：无条件 +1
+        assert_eq!(
+            updated.relationship_revision, before.relationship_revision,
+            "Keep+Keep is a no-op and must not bump the revision"
+        );
+        assert_eq!(updated.updated_at, before.updated_at, "no-op patch must not touch updated_at");
+    }
+
+    #[test]
+    fn relationship_patch_clear_null_tag_keeps_revision() {
+        let mut conn = db::open_in_memory().expect("db");
+        // create_input has tag_id: None — clearing an already-NULL tag is a no-op.
+        let task = insert_task(&conn, &create_input("本来就无标签")).expect("task");
+        let before = get_task(&conn, &task.id).expect("load");
+        assert_eq!(before.tag_id, None);
+
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: before.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Clear,
+            },
+        )
+        .expect("patch");
+        // 🔴 修复前：无条件 +1
+        assert_eq!(
+            updated.relationship_revision, before.relationship_revision,
+            "clearing an already-NULL tag must not bump the revision"
+        );
+    }
+
+    #[test]
+    fn relationship_patch_set_same_tag_keeps_revision() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("已是工作") },
+        )
+        .expect("task");
+
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Set { value: "system-work".to_owned() },
+            },
+        )
+        .expect("patch");
+        // 🔴 修复前：无条件 +1
+        assert_eq!(
+            updated.relationship_revision, task.relationship_revision,
+            "setting the currently-held tag must not bump the revision"
+        );
+    }
+
+    #[test]
+    fn relationship_patch_mixed_change_bumps_once() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("混合补丁") },
+        )
+        .expect("task");
+
+        // tag changes (work → NULL) while the project Set is value-equal to
+        // the current project: exactly ONE bump, no double counting.
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Set { value: task.project_id.clone().expect("abyssal project") },
+                tag: NullablePatch::Clear,
+            },
+        )
+        .expect("patch");
+        assert_eq!(updated.tag_id, None);
+        assert_eq!(updated.relationship_revision, task.relationship_revision + 1);
+    }
+
+    /// Starts a focus round on `task_id` (revision bookkeeping included).
+    fn start_focus_on(conn: &mut Connection, task_id: &str) -> TimerSnapshot {
+        let timer = get_timer(conn).expect("timer");
+        start_timer(
+            conn,
+            &get_settings(conn).expect("settings"),
+            &StartTimerInput {
+                expected_revision: timer.revision,
+                mode: TimerMode::Focus,
+                selected_task_id: Some(task_id.to_owned()),
+            },
+        )
+        .expect("start_timer")
+    }
+
+    #[test]
+    fn title_only_focus_round_keeps_null_tag_on_natural_completion() {
+        let mut conn = db::open_in_memory().expect("db");
+        // 标题-only 创建：无标签、无显式优先级。
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { priority: None, ..create_input("标题-only 任务") },
+        )
+        .expect("task");
+        let timer = start_focus_on(&mut conn, &task.id);
+        let session_id = timer.active_session_id.clone().expect("session");
+
+        // Natural expiry then complete.
+        let mut expired = timer;
+        expired.target_end_at = Some(now_millis() - 500);
+        write_timer(&conn, &expired).expect("write");
+
+        let settings = get_settings(&conn).expect("settings");
+        let result = complete_timer(
+            &mut conn,
+            &settings,
+            &CompleteTimerInput {
+                expected_revision: expired.revision,
+                active_session_id: session_id,
+                recovery: None,
+            },
+        )
+        .expect("complete");
+        // 🔴 修复前：session.tag_id = 'system-other'（计时链路隐式重绑）
+        assert_eq!(result.session.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            result.session.tag_id, None,
+            "a tagless task's focus round must persist tag_id = NULL"
+        );
+        assert_ne!(
+            result.session.tag_name_snapshot.as_deref(),
+            Some("其他"),
+            "snapshot must not claim the fallback tag"
+        );
+    }
+
+    #[test]
+    fn title_only_focus_round_keeps_null_tag_on_manual_finish() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { priority: None, ..create_input("标题-only 手动结束") },
+        )
+        .expect("task");
+        let timer = start_focus_on(&mut conn, &task.id);
+        let session_id = timer.active_session_id.clone().expect("session");
+
+        let result = finish_timer(
+            &mut conn,
+            &FinishTimerInput { expected_revision: timer.revision, active_session_id: session_id },
+        )
+        .expect("finish");
+        // 🔴 修复前：session.tag_id = 'system-other'
+        assert_eq!(result.session.tag_id, None, "manual finish keeps tagless round NULL");
+    }
+
+    #[test]
+    fn switching_to_tagless_task_keeps_null_tag() {
+        let mut conn = db::open_in_memory().expect("db");
+        let tagged = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-work".to_owned()), ..create_input("带标签 A") },
+        )
+        .expect("task");
+        let tagless = insert_task(&conn, &create_input("无标签 B")).expect("task");
+
+        let started = start_focus_on(&mut conn, &tagged.id);
+        assert_eq!(started.tag_id.as_deref(), Some("system-work"));
+
+        let settings = get_settings(&conn).expect("settings");
+        let switched = switch_timer_task(
+            &mut conn,
+            &settings,
+            &SwitchTimerTaskInput {
+                expected_revision: started.revision,
+                active_session_id: started.active_session_id.clone().expect("session"),
+                new_task_id: tagless.id.clone(),
+            },
+        )
+        .expect("switch");
+        // 🔴 修复前：timer 快照被重绑为 system-other
+        assert_eq!(
+            switched.timer.tag_id, None,
+            "switching to a tagless task must not rebind the round to the fallback tag"
+        );
+    }
+
+    #[test]
+    fn explicit_other_tag_round_persists_system_other() {
+        let mut conn = db::open_in_memory().expect("db");
+        // 守护分支：真正选择「其他」的任务不受无标签语义影响。
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { tag_id: Some("system-other".to_owned()), ..create_input("显式其他") },
+        )
+        .expect("task");
+        let timer = start_focus_on(&mut conn, &task.id);
+        let session_id = timer.active_session_id.clone().expect("session");
+
+        let result = finish_timer(
+            &mut conn,
+            &FinishTimerInput { expected_revision: timer.revision, active_session_id: session_id },
+        )
+        .expect("finish");
+        assert_eq!(
+            result.session.tag_id.as_deref(),
+            Some("system-other"),
+            "an explicitly chosen 其他 tag must persist verbatim"
+        );
+    }
+
+    #[test]
+    fn statistics_by_tag_excludes_tagless_from_other() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput { priority: None, ..create_input("无标签统计") },
+        )
+        .expect("task");
+        let timer = start_focus_on(&mut conn, &task.id);
+        let session_id = timer.active_session_id.clone().expect("session");
+        let mut expired = timer;
+        expired.target_end_at = Some(now_millis() - 500);
+        write_timer(&conn, &expired).expect("write");
+        let settings = get_settings(&conn).expect("settings");
+        let _result = complete_timer(
+            &mut conn,
+            &settings,
+            &CompleteTimerInput {
+                expected_revision: expired.revision,
+                active_session_id: session_id,
+                recovery: None,
+            },
+        )
+        .expect("complete");
+
+        let stats = all_time_statistics(&conn).expect("stats");
+        let other = stats.by_tag.iter().find(|t| t.project == "其他");
+        // 🔴 修复前：会话快照落「其他」，统计把无标签投入记入该桶。
+        assert!(
+            other.is_none() || other.is_some_and(|t| t.focus_seconds == 0),
+            "tagless investment must not be credited to 其他: {:?}",
+            stats.by_tag
+        );
+        let tagless = stats.by_tag.iter().find(|t| t.project == "无标签");
+        assert!(
+            tagless.is_some_and(|t| t.focus_seconds > 0),
+            "tagless investment must surface under its own non-affiliation bucket: {:?}",
+            stats.by_tag
+        );
+    }
+
+    #[test]
+    fn break_rounds_keep_fallback_tag_snapshot() {
+        let mut conn = db::open_in_memory().expect("db");
+        // 守护分支：无任务/休息轮次的历史 fallback 行为明确保留。
+        let settings = get_settings(&conn).expect("settings");
+        let timer = start_timer(
+            &mut conn,
+            &settings,
+            &StartTimerInput { expected_revision: 0, mode: TimerMode::Short, selected_task_id: None },
+        )
+        .expect("start break");
+        let session_id = timer.active_session_id.clone().expect("session");
+
+        let result = finish_timer(
+            &mut conn,
+            &FinishTimerInput { expected_revision: timer.revision, active_session_id: session_id },
+        )
+        .expect("finish break");
+        let (fallback_id, _) = fallback_tag(&conn).expect("fallback");
+        assert_eq!(
+            result.session.tag_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "no-task break rounds keep the historical fallback snapshot"
+        );
+    }
+
+    // ─── 批次 1.1：旧值保留（守恒锚点，迁移前后必须恒成立，预期绿）────────────
+
+    #[test]
+    fn updating_title_preserves_tag_and_priority() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("原标题")).expect("task");
+        let tag_before: Option<String> = conn
+            .query_row("SELECT tag_id FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("tag before");
+        let priority_before: Option<String> = conn
+            .query_row("SELECT priority FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("priority before");
+
+        update_task(
+            &conn,
+            &UpdateTaskInput { id: task.id.clone(), title: Some("新标题".to_owned()), ..Default::default() },
+        )
+        .expect("update title");
+
+        let tag_after: Option<String> = conn
+            .query_row("SELECT tag_id FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("tag after");
+        let priority_after: Option<String> = conn
+            .query_row("SELECT priority FROM tasks WHERE id = ?1", params![task.id], |r| r.get(0))
+            .expect("priority after");
+        assert_eq!(tag_after, tag_before, "title-only update must not touch tag_id");
+        assert_eq!(priority_after, priority_before, "title-only update must not touch priority");
+    }
+
+    #[test]
+    fn empty_project_id_detaches_to_standalone() {
+        let conn = db::open_in_memory().expect("db");
+        let task = insert_task(&conn, &create_input("带项目任务")).expect("task");
+        assert!(task.project_id.is_some(), "create_input gives project 'Abyssal'");
+
+        let updated = update_task(
+            &conn,
+            &UpdateTaskInput {
+                id: task.id.clone(),
+                project_id: Some(String::new()), // 显式清空 → standalone
+                ..Default::default()
+            },
+        )
+        .expect("update");
+        assert_eq!(updated.project_id, None, "explicit clear must detach the project");
     }
 
     #[test]
@@ -4206,9 +4895,9 @@ mod tests {
 
         insert_task(&conn, &CreateTaskInput {
             title: "带标签的任务".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             pomodoro_target: 1,
-            priority: TaskPriority::Med,
+            priority: Some(TaskPriority::Med),
             project: "通用".to_owned(),
         
             ..Default::default()
@@ -4496,9 +5185,9 @@ mod tests {
         let mut conn = db::open_in_memory().expect("db");
         let task = insert_task(&conn, &CreateTaskInput {
             title: "Write tests".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             pomodoro_target: 3,
-            priority: TaskPriority::High,
+            priority: Some(TaskPriority::High),
             project: "Backend".to_owned(),
         
             ..Default::default()
@@ -5222,7 +5911,7 @@ mod tests {
         let bundle = parse_backup_text(v1_json).expect("v1 backup parses");
         assert_eq!(bundle.schema_version, 2, "normalized to the v2 shape");
         assert_eq!(bundle.tags.len(), 4);
-        assert_eq!(bundle.tasks[0].tag_id, "system-other");
+        assert_eq!(bundle.tasks[0].tag_id.as_deref(), Some("system-other"));
         assert_eq!(bundle.sessions[0].finish_reason.as_deref(), Some("legacy"));
         assert_eq!(bundle.sessions[0].statistics_eligible, Some(true));
         assert_eq!(bundle.sessions[0].qualification_reason.as_deref(), Some("qualified"));
@@ -5289,9 +5978,9 @@ mod tests {
 
         let task = insert_task(&conn, &CreateTaskInput {
             title: "Backup me".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             pomodoro_target: 6,
-            priority: TaskPriority::Low,
+            priority: Some(TaskPriority::Low),
             project: "Archive".to_owned(),
         
             ..Default::default()
@@ -5374,9 +6063,9 @@ mod tests {
         // Seed real, in-use data: a task and a completed focus session.
         let task = insert_task(&conn, &CreateTaskInput {
             title: "Real task".to_owned(),
-            tag_id: String::new(),
+            tag_id: None,
             pomodoro_target: 2,
-            priority: TaskPriority::High,
+            priority: Some(TaskPriority::High),
             project: "Real".to_owned(),
         
             ..Default::default()

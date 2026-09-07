@@ -7,7 +7,7 @@ use crate::error::CommandError;
 use crate::models::{AppSettings, TimerMode, TimerSnapshot};
 
 /// Bump this whenever a new migration is appended to `MIGRATIONS`.
-pub const LATEST_SCHEMA_VERSION: u32 = 4;
+pub const LATEST_SCHEMA_VERSION: u32 = 5;
 
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
@@ -246,6 +246,315 @@ fn run_v3_migration(tx: &Transaction) -> Result<(), CommandError> {
         return Err(CommandError::database(format!(
             "foreign_key_check reported {violations} violating rows after the v3 migration"
         )));
+    }
+    Ok(())
+}
+
+/// 1.3 conservation: per-child-table audit that the rebuild preserved every
+/// task link — not just how many. Row counts, non-NULL counts and time sums
+/// CANNOT catch a swap of task ids between two rows; a bidirectional EXCEPT
+/// on (id, task_id) can.
+fn assert_child_task_links_preserved(
+    tx: &Transaction<'_>,
+    old_table: &str,
+    new_table: &str,
+) -> Result<(), CommandError> {
+    let scalar = |sql: &str| -> Result<i64, CommandError> {
+        tx.query_row(sql, [], |row| row.get(0))
+            .map_err(|err| CommandError::database(format!("v5 conservation query failed: {err}")))
+    };
+    // Row-level link conservation (Codex 复审阻断 3): COUNT-based checks only
+    // prove the NUMBER of links survived — two rows could swap task_id and
+    // still pass. A symmetric (id, task_id) EXCEPT proves every row points at
+    // the SAME task, in both directions.
+    let old_minus_new = scalar(&format!(
+        "SELECT COUNT(*) FROM (SELECT id, task_id FROM {old_table} EXCEPT SELECT id, task_id FROM {new_table})"
+    ))?;
+    if old_minus_new != 0 {
+        return Err(CommandError::database(format!(
+            "v5 migration conservation mismatch ({old_table} links changed on rebuild): {old_minus_new} row(s) lost their original task_id"
+        )));
+    }
+    let new_minus_old = scalar(&format!(
+        "SELECT COUNT(*) FROM (SELECT id, task_id FROM {new_table} EXCEPT SELECT id, task_id FROM {old_table})"
+    ))?;
+    if new_minus_old != 0 {
+        return Err(CommandError::database(format!(
+            "v5 migration conservation mismatch ({old_table} links changed on rebuild): {new_minus_old} row(s) point at a different task_id"
+        )));
+    }
+    Ok(())
+}
+
+/// Runs the v4 → v5 migration ("management glass", optional task metadata):
+///
+/// 1. rebuilds `tasks` so `tag_id` and `priority` become NULL-able (v4 had
+///    them NOT NULL — `priority TEXT NOT NULL DEFAULT 'med'` and
+///    `tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT` — and
+///    SQLite cannot ALTER an existing column constraint away; the v2→v3
+///    rename-first rebuild is the precedent);
+/// 2. rebuilds `sessions`, `budget_history` and `focus_segments` in the same
+///    transaction ONLY to re-point their `task_id` foreign keys at the fresh
+///    table (values are copied verbatim — no rewrite, no recompute);
+/// 3. preserves every historical value: a task tagged 「其他」 with priority
+///    「中」 stays exactly that — NULL-ability only affects FUTURE writes
+///    (title-only creation), never a mass clear of existing data;
+/// 4. audits conservation BEFORE dropping the old shapes (1.3): per-table row
+///    counts, total invested time (sessions focused_seconds, focus_segments
+///    effective_ms), per-child task-link counts, a symmetric EXCEPT diff of
+///    (id, tag_id, priority) on tasks, and the timer_state binding. Any
+///    mismatch fails the whole transaction;
+/// 5. verifies `PRAGMA foreign_key_check` is clean before committing.
+///
+/// `timer_state` needs no rebuild: `selected_task_id` is a bare TEXT column
+/// with no FK (its binding survives because task ids are preserved verbatim)
+/// and `tag_id` references `tags`, which this migration does not touch.
+fn run_v5_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
+    // 0) timer_state is never rebuilt, but its binding must survive the
+    //    rebuild VERBATIM (Codex 复审阻断 3): snapshot the values up front and
+    //    compare after the old shapes are gone — a non-tautological
+    //    before/after proof instead of a self-join that always passes.
+    let timer_binding_before: Vec<Option<String>> = {
+        let mut stmt = tx.prepare("SELECT selected_task_id FROM timer_state ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    // 1) Rename all four shapes first: the rename rewrites child FKs to the
+    //    `_v4_old` names, so the fresh tables define their FKs against the
+    //    final `tasks` name and the old rows can be dropped without ever
+    //    violating a constraint. `foreign_keys` stays ON throughout (v3
+    //    precedent, run_v3_migration step 2).
+    tx.execute_batch(
+        "ALTER TABLE tasks RENAME TO tasks_v4_old;
+         ALTER TABLE sessions RENAME TO sessions_v4_old;
+         ALTER TABLE budget_history RENAME TO budget_history_v4_old;
+         ALTER TABLE focus_segments RENAME TO focus_segments_v4_old;",
+    )?;
+
+    // 2) v5 tasks: `tag_id` / `priority` become NULL-able (defaults dropped —
+    //    "unspecified" must be NULL, not a silent 'med'). Everything else
+    //    keeps the exact v4 shape.
+    tx.execute_batch(
+        "CREATE TABLE tasks (
+            id              TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            done            INTEGER NOT NULL DEFAULT 0,
+            pomodoro_target INTEGER NOT NULL DEFAULT 1,
+            priority        TEXT,
+            project         TEXT NOT NULL DEFAULT '通用',
+            tag_id          TEXT REFERENCES tags(id) ON DELETE RESTRICT,
+            sort_order      INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            completed_at    INTEGER,
+            profile_id      TEXT NOT NULL DEFAULT 'local',
+            project_id      TEXT REFERENCES projects(id),
+            target_seconds  INTEGER NOT NULL DEFAULT 0,
+            budget_source   TEXT NOT NULL DEFAULT 'migration',
+            status          TEXT NOT NULL DEFAULT 'todo',
+            deadline        TEXT,
+            notes           TEXT NOT NULL DEFAULT '',
+            relationship_revision INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+
+    // 3) Child tables rebuilt with IDENTICAL shapes — only their FK targets
+    //    move to the fresh tasks table. Column lists mirror the v3/v4
+    //    definitions exactly (sessions: v3 shape + v4 profile_id ALTER).
+    tx.execute_batch(
+        "CREATE TABLE sessions (
+            id                  TEXT PRIMARY KEY,
+            task_id             TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            task_title_snapshot TEXT NOT NULL,
+            project_snapshot    TEXT NOT NULL,
+            tag_id              TEXT REFERENCES tags(id) ON DELETE SET NULL,
+            tag_name_snapshot   TEXT NOT NULL,
+            mode                TEXT NOT NULL,
+            status              TEXT NOT NULL,
+            planned_seconds     INTEGER NOT NULL,
+            focused_seconds     INTEGER NOT NULL CHECK (focused_seconds >= 0),
+            started_at          INTEGER NOT NULL,
+            ended_at            INTEGER NOT NULL,
+            finish_reason       TEXT NOT NULL CHECK (finish_reason IN
+                                  ('elapsed','manual_finish','reset','mode_change','legacy')),
+            statistics_eligible INTEGER NOT NULL CHECK (statistics_eligible IN (0,1)),
+            qualification_reason TEXT NOT NULL CHECK (qualification_reason IN
+                                  ('qualified','too_short','abandoned','non_focus','legacy')),
+            profile_id          TEXT NOT NULL DEFAULT 'local'
+        );
+
+        CREATE TABLE budget_history (
+            id                 TEXT PRIMARY KEY,
+            task_id            TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            old_target_seconds INTEGER,
+            new_target_seconds INTEGER NOT NULL,
+            source             TEXT NOT NULL CHECK (source IN ('creation','migration','recalc')),
+            created_at         INTEGER NOT NULL
+        );
+
+        CREATE TABLE focus_segments (
+            id                    TEXT PRIMARY KEY,
+            profile_id            TEXT NOT NULL REFERENCES profiles(id),
+            session_id            TEXT NOT NULL,
+            task_id               TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            project_id_snapshot   TEXT,
+            project_name_snapshot TEXT NOT NULL,
+            category_id_snapshot  TEXT,
+            category_name_snapshot TEXT NOT NULL DEFAULT '',
+            effective_start_ms    INTEGER NOT NULL,
+            effective_end_ms      INTEGER NOT NULL,
+            effective_ms          INTEGER NOT NULL CHECK (effective_ms >= 0),
+            state                 TEXT NOT NULL DEFAULT 'pending'
+                                  CHECK (state IN ('pending','confirmed','void')),
+            temporal_precision    TEXT NOT NULL DEFAULT 'effective_interval'
+                                  CHECK (temporal_precision IN ('effective_interval','legacy_total_only')),
+            created_at            INTEGER NOT NULL
+        );",
+    )?;
+
+    // 4) Copy every row verbatim — no value rewrites, no recomputation (R2).
+    tx.execute_batch(
+        "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
+                            sort_order, created_at, updated_at, completed_at, profile_id,
+                            project_id, target_seconds, budget_source, status, deadline, notes,
+                            relationship_revision)
+         SELECT id, title, done, pomodoro_target, priority, project, tag_id,
+                sort_order, created_at, updated_at, completed_at, profile_id,
+                project_id, target_seconds, budget_source, status, deadline, notes,
+                0
+         FROM tasks_v4_old;
+
+        INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                              tag_name_snapshot, mode, status, planned_seconds,
+                              focused_seconds, started_at, ended_at, finish_reason,
+                              statistics_eligible, qualification_reason, profile_id)
+         SELECT id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                tag_name_snapshot, mode, status, planned_seconds,
+                focused_seconds, started_at, ended_at, finish_reason,
+                statistics_eligible, qualification_reason, profile_id
+         FROM sessions_v4_old;
+
+        INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds,
+                                    source, created_at)
+         SELECT id, task_id, old_target_seconds, new_target_seconds, source, created_at
+         FROM budget_history_v4_old;
+
+        INSERT INTO focus_segments (id, profile_id, session_id, task_id, project_id_snapshot,
+                                    project_name_snapshot, category_id_snapshot,
+                                    category_name_snapshot, effective_start_ms,
+                                    effective_end_ms, effective_ms, state,
+                                    temporal_precision, created_at)
+         SELECT id, profile_id, session_id, task_id, project_id_snapshot,
+                project_name_snapshot, category_id_snapshot,
+                category_name_snapshot, effective_start_ms,
+                effective_end_ms, effective_ms, state,
+                temporal_precision, created_at
+         FROM focus_segments_v4_old;",
+    )?;
+
+    // 5) Conservation audit (1.3): `foreign_key_check` passing is NOT data
+    //    preservation — a CASCADE could have silently deleted history. Every
+    //    mismatch rolls the whole transaction back.
+    let scalar = |sql: &str| -> Result<i64, CommandError> {
+        tx.query_row(sql, [], |row| row.get(0))
+            .map_err(|err| CommandError::database(format!("v5 conservation query failed: {err}")))
+    };
+    let conservation = |label: &str, old: i64, new: i64| -> Result<(), CommandError> {
+        if old != new {
+            return Err(CommandError::database(format!(
+                "v5 migration conservation mismatch ({label}): {old} -> {new}"
+            )));
+        }
+        Ok(())
+    };
+
+    conservation("tasks.row_count", scalar("SELECT COUNT(*) FROM tasks_v4_old")?, scalar("SELECT COUNT(*) FROM tasks")?)?;
+    conservation("sessions.row_count", scalar("SELECT COUNT(*) FROM sessions_v4_old")?, scalar("SELECT COUNT(*) FROM sessions")?)?;
+    conservation("budget_history.row_count", scalar("SELECT COUNT(*) FROM budget_history_v4_old")?, scalar("SELECT COUNT(*) FROM budget_history")?)?;
+    conservation("focus_segments.row_count", scalar("SELECT COUNT(*) FROM focus_segments_v4_old")?, scalar("SELECT COUNT(*) FROM focus_segments")?)?;
+    conservation(
+        "sessions.focused_seconds_total",
+        scalar("SELECT COALESCE(SUM(focused_seconds), 0) FROM sessions_v4_old")?,
+        scalar("SELECT COALESCE(SUM(focused_seconds), 0) FROM sessions")?,
+    )?;
+    conservation(
+        "focus_segments.effective_ms_total",
+        scalar("SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments_v4_old")?,
+        scalar("SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments")?,
+    )?;
+    // Historical metadata values must survive VERBATIM (「历史『其他』『中』不被
+    // 批量清空」): a symmetric EXCEPT diff over (id, tag_id, priority) must be
+    // empty in BOTH directions.
+    conservation(
+        "tasks.old_minus_new(id,tag_id,priority)",
+        scalar("SELECT COUNT(*) FROM (SELECT id, tag_id, priority FROM tasks_v4_old EXCEPT SELECT id, tag_id, priority FROM tasks)")?,
+        0,
+    )?;
+    conservation(
+        "tasks.new_minus_old(id,tag_id,priority)",
+        scalar("SELECT COUNT(*) FROM (SELECT id, tag_id, priority FROM tasks EXCEPT SELECT id, tag_id, priority FROM tasks_v4_old)")?,
+        0,
+    )?;
+    // Per-child link conservation (Codex 复审阻断 3): COUNT-based checks only
+    // prove the NUMBER of links — two rows could swap task_id and pass. The
+    // (id, task_id) pairs themselves are audited symmetrically for all three
+    // child tables; budget_history is NOT covered by its row count (its
+    // task_id is NOT NULL, but a swap preserves counts all the same).
+    assert_child_task_links_preserved(tx, "sessions_v4_old", "sessions")?;
+    assert_child_task_links_preserved(tx, "budget_history_v4_old", "budget_history")?;
+    assert_child_task_links_preserved(tx, "focus_segments_v4_old", "focus_segments")?;
+    // timer_state binding (bare TEXT, no FK): the dangling-reference count is
+    // checked against BOTH the old and the new tasks shapes — a non-trivial
+    // proof that no selected task id was lost by the rebuild. (A plain link
+    // count against itself would be tautological: timer_state is not rebuilt.)
+    conservation(
+        "timer_state.dangling_selected_task",
+        scalar("SELECT COUNT(*) FROM timer_state WHERE selected_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tasks_v4_old WHERE id = timer_state.selected_task_id)")?,
+        scalar("SELECT COUNT(*) FROM timer_state WHERE selected_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tasks WHERE id = timer_state.selected_task_id)")?,
+    )?;
+
+    // 6) Drop old shapes (children first), then recreate every index whose
+    //    parent table was rebuilt (dropping a table drops its indexes).
+    tx.execute_batch(
+        "DROP TABLE focus_segments_v4_old;
+         DROP TABLE budget_history_v4_old;
+         DROP TABLE sessions_v4_old;
+         DROP TABLE tasks_v4_old;
+         CREATE INDEX IF NOT EXISTS idx_tasks_sort_order ON tasks(sort_order);
+         CREATE INDEX IF NOT EXISTS idx_tasks_tag_sort ON tasks(tag_id, sort_order);
+         CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+         CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+         CREATE INDEX IF NOT EXISTS idx_sessions_task_id ON sessions(task_id);
+         CREATE INDEX IF NOT EXISTS idx_sessions_tag_started ON sessions(tag_id, started_at);
+         CREATE INDEX IF NOT EXISTS idx_sessions_qualification
+             ON sessions(mode, statistics_eligible, started_at);
+         CREATE INDEX IF NOT EXISTS idx_budget_history_task ON budget_history(task_id);
+         CREATE INDEX IF NOT EXISTS idx_segments_session ON focus_segments(session_id);
+         CREATE INDEX IF NOT EXISTS idx_segments_task_state ON focus_segments(task_id, state);",
+    )?;
+
+    // 7) No dangling references may survive the upgrade.
+    let violations: usize = tx
+        .prepare("PRAGMA foreign_key_check")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .count();
+    if violations > 0 {
+        return Err(CommandError::database(format!(
+            "foreign_key_check reported {violations} violating rows after the v5 migration"
+        )));
+    }
+
+    // 8) timer_state binding survived VERBATIM (step 0 snapshot).
+    let timer_binding_after: Vec<Option<String>> = {
+        let mut stmt = tx.prepare("SELECT selected_task_id FROM timer_state ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if timer_binding_before != timer_binding_after {
+        return Err(CommandError::database(
+            "v5 migration conservation mismatch (timer_state.selected_task_id): the binding changed across the rebuild",
+        ));
     }
     Ok(())
 }
@@ -557,6 +866,16 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), CommandError> {
         tx.commit()?;
     }
 
+    if current < 5 {
+        // v5 is pure metadata NULL-ability: no user decisions, no recomputes
+        // — the automatic path needs no preview parameters (R06 preview
+        // dispatch is handled separately in task 1.4).
+        let tx = conn.transaction()?;
+        run_v5_migration(&tx)?;
+        tx.pragma_update(None, "user_version", 5u32)?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -829,6 +1148,14 @@ pub fn run_migrations_with(conn: &mut Connection, params: &crate::models::Migrat
         let tx = conn.transaction()?;
         run_v4_migration_with(&tx, params)?;
         tx.pragma_update(None, "user_version", 4u32)?;
+        tx.commit()?
+    }
+    if current < 5 {
+        // v5 is pure metadata NULL-ability: no user decisions involved, so
+        // the parameterised R06 entry takes the same automatic path.
+        let tx = conn.transaction()?;
+        run_v5_migration(&tx)?;
+        tx.pragma_update(None, "user_version", 5u32)?;
         tx.commit()?
     }
     Ok(())
@@ -1225,7 +1552,9 @@ mod tests {
         }
 
         let conn = open_at(&db_path).expect("open_at should migrate v3 → v4");
-        assert_eq!(schema_version(&conn).unwrap(), 4);
+        // open_at runs the FULL chain (now through v5); the assertions below
+        // pin the v4 semantic outcomes, which v5 preserves verbatim.
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
 
         // The free-text project became a real project under 其他.
         let project: (String, String, String) = conn
@@ -1624,6 +1953,378 @@ mod tests {
             [],
         )
         .expect("session break");
+    }
+
+    /// Builds a genuine v4 on-disk database by applying the REAL migration
+    /// chain (V1+V2 batches, then run_v3_migration / run_v4_migration) and
+    /// seeding representative user data — never a hand-copied schema.
+    ///
+    /// Fixture totals (asserted verbatim by the v5 conservation tests):
+    /// 3 tasks / 2 sessions / 3 budget rows / 2 segments; invested time =
+    /// 900 focused seconds = 900,000 effective ms; task links: sessions 1,
+    /// segments 1, budget 3; timer bound to 't-keep1'.
+    fn build_v4_database(db_path: &Path) {
+        let mut conn = Connection::open(db_path).expect("open");
+        conn.execute_batch(MIGRATION_V1).expect("apply v1");
+        conn.execute_batch(MIGRATION_V2).expect("apply v2");
+        conn.pragma_update(None, "user_version", 2u32).expect("v2 marker");
+        {
+            let tx = conn.transaction().expect("tx");
+            run_v3_migration(&tx).expect("v3 step");
+            tx.pragma_update(None, "user_version", 3u32).expect("v3 marker");
+            tx.commit().expect("commit v3");
+        }
+        {
+            let tx = conn.transaction().expect("tx");
+            run_v4_migration(&tx).expect("v4 step");
+            tx.pragma_update(None, "user_version", 4u32).expect("v4 marker");
+            tx.commit().expect("commit v4");
+        }
+        seed_defaults(&conn).expect("seed settings/timer");
+
+        // Three tasks carrying exactly the historical values v5 must preserve
+        // verbatim (历史『其他』『中』不被批量清空): other/med, work/high, study/low.
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
+                                sort_order, created_at, updated_at, completed_at, profile_id,
+                                project_id, target_seconds, budget_source, status, deadline, notes)
+             VALUES ('t-keep1', '保留任务一', 0, 1, 'med', '通用', 'system-other',
+                     0, 1, 1, NULL, 'local', NULL, 1500, 'migration', 'todo', NULL, ''),
+                    ('t-keep2', '保留任务二', 0, 2, 'high', '通用', 'system-work',
+                     1, 1, 1, NULL, 'local', NULL, 3000, 'migration', 'todo', NULL, ''),
+                    ('t-keep3', '保留任务三', 1, 1, 'low', '通用', 'system-study',
+                     2, 1, 1, 2, 'local', NULL, 1500, 'migration', 'done', NULL, '');
+            INSERT INTO budget_history (id, task_id, old_target_seconds, new_target_seconds, source, created_at)
+             VALUES ('bh-1', 't-keep1', NULL, 1500, 'migration', 1),
+                    ('bh-2', 't-keep2', NULL, 3000, 'migration', 1),
+                    ('bh-3', 't-keep3', NULL, 1500, 'migration', 1);
+            INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                                  tag_name_snapshot, mode, status, planned_seconds,
+                                  focused_seconds, started_at, ended_at, finish_reason,
+                                  statistics_eligible, qualification_reason, profile_id)
+             VALUES ('s-1', 't-keep1', '保留任务一', '通用', 'system-other', '其他', 'focus', 'completed',
+                     1500, 600, 1, 2, 'elapsed', 1, 'qualified', 'local'),
+                    ('s-2', NULL, '自由轮次', '通用', NULL, '', 'short', 'completed',
+                     300, 300, 3, 4, 'elapsed', 0, 'non_focus', 'local');
+            INSERT INTO focus_segments (id, profile_id, session_id, task_id, project_id_snapshot,
+                                        project_name_snapshot, category_id_snapshot,
+                                        category_name_snapshot, effective_start_ms,
+                                        effective_end_ms, effective_ms, state,
+                                        temporal_precision, created_at)
+             VALUES ('seg-1', 'local', 's-1', 't-keep1', NULL, '通用', NULL, '',
+                     1, 601000, 600000, 'confirmed', 'effective_interval', 2),
+                    ('seg-2', 'local', 's-2', NULL, NULL, '通用', NULL, '',
+                     3, 300003, 300000, 'confirmed', 'effective_interval', 4);
+            UPDATE timer_state SET selected_task_id = 't-keep1' WHERE id = 1;",
+        )
+        .expect("seed v4 fixture data");
+    }
+
+    // ─── 批次 1：v4 → v5（可空元数据；rename-first 重建 + 守恒对账）────────────
+
+
+    #[test]
+    fn v5_migration_conserves_exact_task_links_per_child_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v5links-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        let conn = open_at(&db_path).expect("v5 upgrade should succeed");
+
+        // Row-level link conservation: every child row must still point at
+        // the SAME task id (fixture-known values). A swap that preserves row
+        // counts, NOT-NULL counts and time sums must FAIL here and in the
+        // in-migration EXCEPT audit.
+        let links = |table: &str| -> Vec<(String, Option<String>)> {
+            conn.prepare(&format!("SELECT id, task_id FROM {table} ORDER BY id"))
+                .expect("prepare")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+        assert_eq!(
+            links("sessions"),
+            vec![("s-1".to_owned(), Some("t-keep1".to_owned())), ("s-2".to_owned(), None)],
+            "sessions.task_id must survive verbatim"
+        );
+        assert_eq!(
+            links("budget_history"),
+            vec![
+                ("bh-1".to_owned(), Some("t-keep1".to_owned())),
+                ("bh-2".to_owned(), Some("t-keep2".to_owned())),
+                ("bh-3".to_owned(), Some("t-keep3".to_owned())),
+            ],
+            "budget_history.task_id must survive verbatim"
+        );
+        assert_eq!(
+            links("focus_segments"),
+            vec![
+                ("seg-1".to_owned(), Some("t-keep1".to_owned())),
+                ("seg-2".to_owned(), None),
+            ],
+            "focus_segments.task_id must survive verbatim"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v5_migration_timer_binding_survives_verbatim() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v5timer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        // Read the pre-migration binding with a throwaway connection.
+        let before: Option<String> = {
+            let raw = Connection::open(&db_path).expect("reopen fixture");
+            raw.query_row(
+                "SELECT selected_task_id FROM timer_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("pre-migration binding")
+        };
+
+        let conn = open_at(&db_path).expect("v5 upgrade should succeed");
+        let after: Option<String> = conn
+            .query_row("SELECT selected_task_id FROM timer_state WHERE id = 1", [], |r| r.get(0))
+            .expect("post-migration binding");
+        assert_eq!(after, before, "timer_state.selected_task_id must survive verbatim");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn migrates_v4_to_v5_preserving_all_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        let conn = open_at(&db_path).expect("v5 upgrade should succeed");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+
+        // Historical values survive VERBATIM — no batch clear of 「其他」/「中」.
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT id, tag_id, priority FROM tasks ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("t-keep1".to_owned(), Some("system-other".to_owned()), Some("med".to_owned())),
+                ("t-keep2".to_owned(), Some("system-work".to_owned()), Some("high".to_owned())),
+                ("t-keep3".to_owned(), Some("system-study".to_owned()), Some("low".to_owned())),
+            ]
+        );
+
+        // The whole point of v5: the two metadata columns accept NULL.
+        conn.execute("UPDATE tasks SET tag_id = NULL WHERE id = 't-keep3'", [])
+            .expect("tag_id must be nullable after v5");
+        conn.execute("UPDATE tasks SET priority = NULL WHERE id = 't-keep3'", [])
+            .expect("priority must be nullable after v5");
+
+        // Every index whose parent table was rebuilt is present again.
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND tbl_name IN ('tasks','sessions','budget_history','focus_segments')",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        for expected in [
+            "idx_budget_history_task",
+            "idx_segments_session",
+            "idx_segments_task_state",
+            "idx_sessions_qualification",
+            "idx_sessions_started_at",
+            "idx_sessions_task_id",
+            "idx_sessions_tag_started",
+            "idx_tasks_project",
+            "idx_tasks_sort_order",
+            "idx_tasks_tag_sort",
+        ] {
+            assert!(indexes.iter().any(|i| i == expected), "missing index {expected}: {indexes:?}");
+        }
+
+        // timer_state binding survives the rebuild (bare TEXT, ids preserved).
+        let selected: Option<String> = conn
+            .query_row("SELECT selected_task_id FROM timer_state WHERE id = 1", [], |r| r.get(0))
+            .expect("timer row");
+        assert_eq!(selected.as_deref(), Some("t-keep1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v5_migration_conserves_rows_and_invested_time() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v5con-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        let conn = open_at(&db_path).expect("v5 upgrade should succeed");
+
+        // Row counts, per table (fixture: 3 / 2 / 3 / 2).
+        assert_eq!(count(&conn, "tasks"), 3);
+        assert_eq!(count(&conn, "sessions"), 2);
+        assert_eq!(count(&conn, "budget_history"), 3);
+        assert_eq!(count(&conn, "focus_segments"), 2);
+
+        // Total invested time — the 1.3 conservation headline.
+        let focused: i64 = conn
+            .query_row("SELECT COALESCE(SUM(focused_seconds), 0) FROM sessions", [], |r| r.get(0))
+            .expect("focused sum");
+        assert_eq!(focused, 900, "total invested seconds must survive the rebuild");
+        let effective: i64 = conn
+            .query_row("SELECT COALESCE(SUM(effective_ms), 0) FROM focus_segments", [], |r| r.get(0))
+            .expect("effective sum");
+        assert_eq!(effective, 900_000, "total invested ms must survive the rebuild");
+
+        // Task-link distributions (CASCADE must not have eaten anything).
+        let session_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions WHERE task_id IS NOT NULL", [], |r| r.get(0))
+            .expect("session links");
+        assert_eq!(session_links, 1);
+        let segment_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM focus_segments WHERE task_id IS NOT NULL", [], |r| r.get(0))
+            .expect("segment links");
+        assert_eq!(segment_links, 1);
+        let budget_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM budget_history WHERE task_id IS NOT NULL", [], |r| r.get(0))
+            .expect("budget links");
+        assert_eq!(budget_links, 3);
+
+        // The rebuilt foreign keys still pass the check.
+        let violations: usize = conn
+            .prepare("PRAGMA foreign_key_check")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .count();
+        assert_eq!(violations, 0, "foreign_key_check must stay clean after v5");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v5_migration_handles_an_empty_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-v5empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        // Empty every business table (conservation must pass with all zeros).
+        {
+            let raw = Connection::open(&db_path).expect("reopen fixture");
+            raw.execute_batch(
+                "DELETE FROM focus_segments;
+                 DELETE FROM budget_history;
+                 DELETE FROM sessions;
+                 DELETE FROM tasks;
+                 UPDATE timer_state SET selected_task_id = NULL;",
+            )
+            .expect("empty the fixture");
+        }
+
+        let conn = open_at(&db_path).expect("v5 upgrade should succeed on empty data");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(count(&conn, "tasks"), 0);
+        assert_eq!(count(&conn, "sessions"), 0);
+        assert_eq!(count(&conn, "budget_history"), 0);
+        assert_eq!(count(&conn, "focus_segments"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── Codex 复审阻断 3：守恒对账必须捕捉 task_id 换绑 ────────────────────────
+    // 行数、非空关联数与时间总和完全一致的两份数据，仍可能发生子表行之间的
+    // task_id 互换——守恒审计必须对 (id, task_id) 做双向 EXCEPT 才能拦截。
+
+    #[test]
+    fn child_link_conservation_catches_a_swapped_task_id_in_sessions() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        let tx = conn.transaction().expect("tx");
+        tx.execute_batch(
+            "CREATE TABLE sessions_old (id TEXT PRIMARY KEY, task_id TEXT);
+             CREATE TABLE sessions_new (id TEXT PRIMARY KEY, task_id TEXT);
+             INSERT INTO sessions_old VALUES ('s1','tA'), ('s2','tB');
+             INSERT INTO sessions_new VALUES ('s1','tB'), ('s2','tA');",
+        )
+        .expect("fixture");
+        let result = assert_child_task_links_preserved(&tx, "sessions_old", "sessions_new");
+        assert!(
+            result.is_err(),
+            "a swapped task_id (counts identical) must fail the conservation audit"
+        );
+    }
+
+    #[test]
+    fn child_link_conservation_catches_a_swapped_task_id_in_budget_history() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        let tx = conn.transaction().expect("tx");
+        tx.execute_batch(
+            "CREATE TABLE budget_history_old (id TEXT PRIMARY KEY, task_id TEXT);
+             CREATE TABLE budget_history_new (id TEXT PRIMARY KEY, task_id TEXT);
+             INSERT INTO budget_history_old VALUES ('bh1','tA'), ('bh2','tB');
+             INSERT INTO budget_history_new VALUES ('bh1','tB'), ('bh2','tA');",
+        )
+        .expect("fixture");
+        let result = assert_child_task_links_preserved(&tx, "budget_history_old", "budget_history_new");
+        assert!(result.is_err(), "a swapped task_id must fail the conservation audit");
+    }
+
+    #[test]
+    fn child_link_conservation_catches_a_swapped_task_id_in_focus_segments() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        let tx = conn.transaction().expect("tx");
+        tx.execute_batch(
+            "CREATE TABLE focus_segments_old (id TEXT PRIMARY KEY, task_id TEXT);
+             CREATE TABLE focus_segments_new (id TEXT PRIMARY KEY, task_id TEXT);
+             INSERT INTO focus_segments_old VALUES ('seg1','tA'), ('seg2','tB');
+             INSERT INTO focus_segments_new VALUES ('seg1','tB'), ('seg2','tA');",
+        )
+        .expect("fixture");
+        let result = assert_child_task_links_preserved(&tx, "focus_segments_old", "focus_segments_new");
+        assert!(result.is_err(), "a swapped task_id must fail the conservation audit");
     }
 
     #[test]

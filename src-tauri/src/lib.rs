@@ -199,6 +199,7 @@ pub fn run() {
             commands::bootstrap_app,
             commands::create_task,
             commands::update_task,
+            commands::apply_task_relationship,
             commands::delete_task,
             commands::list_tags,
             commands::create_tag,

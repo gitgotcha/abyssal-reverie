@@ -201,10 +201,6 @@ pub struct DeleteTagResult {
 /// migration. Used to backfill tasks/sessions written before v1.1.
 pub const FALLBACK_TAG_ID: &str = "system-other";
 
-fn default_task_tag_id() -> String {
-    FALLBACK_TAG_ID.to_owned()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -212,7 +208,9 @@ pub struct Task {
     pub title: String,
     pub done: bool,
     pub pomodoro_target: i64,
-    pub priority: TaskPriority,
+    /// v5: optional — NULL means the user never picked a priority.
+    #[serde(default)]
+    pub priority: Option<TaskPriority>,
     /// Resolved display name of the owning project (or `通用` when the task
     /// is standalone). Kept in sync with `project_id`; used for session
     /// snapshots and preserved in v2 backups for compatibility.
@@ -235,14 +233,18 @@ pub struct Task {
     /// v1.2: free notes.
     #[serde(default)]
     pub notes: String,
-    /// Owning primary tag. Defaults to the fallback tag for data written
-    /// before v1.1 (old backup JSON lacks the field).
-    #[serde(default = "default_task_tag_id")]
-    pub tag_id: String,
+    /// v5: optional owning tag — NULL means title-only creation or an
+    /// explicit clear. Historical rows keep their pre-v5 tags verbatim.
+    #[serde(default)]
+    pub tag_id: Option<String>,
     pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
+    /// v1.4 (batch 1): optimistic-concurrency guard for relationship changes.
+    /// Incremented ONLY by `apply_relationship_patch`, never by other writes.
+    #[serde(default)]
+    pub relationship_revision: i64,
 }
 
 fn default_task_status() -> String {
@@ -427,7 +429,12 @@ pub struct Statistics {
 pub struct CreateTaskInput {
     pub title: String,
     pub pomodoro_target: i64,
-    pub priority: TaskPriority,
+    /// v5: `None` (or JSON `null`) = 未选择 → stored as NULL. A JSON string
+    /// keeps its explicit-selection meaning. Legacy callers that always sent
+    /// the fallback id keep working — they now get a task explicitly tagged
+    /// 「其他」 instead of one silently retagged.
+    #[serde(default)]
+    pub priority: Option<TaskPriority>,
     /// v1.2: owning project id (None/empty = standalone task). The legacy
     /// free-text `project` field is ignored when a project_id is present.
     #[serde(default)]
@@ -441,9 +448,44 @@ pub struct CreateTaskInput {
     /// v1.2: free notes.
     #[serde(default)]
     pub notes: Option<String>,
-    /// Primary tag; defaults to the fallback tag for callers predating v1.1.
-    #[serde(default = "default_task_tag_id")]
-    pub tag_id: String,
+    /// v5: `None`/empty = 未选择 → stored as NULL (title-only creation no
+    /// longer lands on the fallback tag); a non-empty id is used verbatim.
+    #[serde(default)]
+    pub tag_id: Option<String>,
+}
+
+/// v1.4 (batch 1): explicit optional-metadata patch — distinguishes "not
+/// mentioned" (`keep`) from "clear to NULL" (`clear`). Mirrors the frontend
+/// `NullablePatch<T>` discriminated union; never conflate the two with a bare
+/// `Option<T>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum NullablePatch<T> {
+    Keep,
+    Clear,
+    Set { value: T },
+}
+
+impl<T> NullablePatch<T> {
+    /// Serde default so an absent field means "keep current value".
+    pub fn keep() -> Self {
+        NullablePatch::Keep
+    }
+}
+
+/// v1.4 (batch 1): atomic task-relationship change guarded by an optimistic
+/// revision. The revision increments ONLY here — normal task edits never
+/// touch it, so a stale `expectedRevision` always means a genuine concurrent
+/// relationship change. Mirrors the frontend `RelationshipPatch`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipPatch {
+    pub task_id: String,
+    pub expected_revision: i64,
+    #[serde(default = "NullablePatch::keep")]
+    pub project: NullablePatch<String>,
+    #[serde(default = "NullablePatch::keep")]
+    pub tag: NullablePatch<String>,
 }
 
 fn default_task_project() -> String {
@@ -933,7 +975,9 @@ mod tests {
         let task: Task = serde_json::from_value(json).expect("deserializable");
 
         assert_eq!(task.pomodoro_target, 4);
-        assert_eq!(task.priority, TaskPriority::High);
+        assert_eq!(task.priority, Some(TaskPriority::High));
+        assert_eq!(task.tag_id, None, "old payload without tagId means 未选择");
+        assert_eq!(task.relationship_revision, 0, "absent revision defaults to 0");
         assert_eq!(task.sort_order, 2);
         assert_eq!(task.completed_at, None);
     }

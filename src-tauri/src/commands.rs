@@ -11,7 +11,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::error::CommandError;
 use crate::models::{
     AppSettings, BootstrapPayload, CompleteTimerInput, CompleteTimerResult, CreateTagInput,
-    CreateTaskInput, DeleteTagResult, ExportBundle, ExportSummary, FinishTimerInput,
+    CreateTaskInput, DeleteTagResult, ExportSummary, FinishTimerInput,
     FinishTimerResult, ImportPreview, ImportSummary, SaveSettingsResult, SessionQuery,
     StartTimerInput, Statistics, StatisticsQuery, SwitchTimerModeInput, Tag, TagDeletePreview,
     Task, TimerRevisionInput, TimerSession, TimerSnapshot, UpdateTagInput, UpdateTaskInput,
@@ -110,6 +110,17 @@ pub fn create_task(state: State<'_, AppState>, input: CreateTaskInput) -> Result
 pub fn update_task(state: State<'_, AppState>, input: UpdateTaskInput) -> Result<Task, CommandError> {
     let conn = lock_db(&state)?;
     repository::update_task(&conn, &input)
+}
+
+/// v1.4 (batch 1): atomic task-relationship change (project/tag clear|set)
+/// guarded by the task's relationship revision.
+#[tauri::command]
+pub fn apply_task_relationship(
+    state: State<'_, AppState>,
+    patch: crate::models::RelationshipPatch,
+) -> Result<Task, CommandError> {
+    let mut conn = lock_db(&state)?;
+    repository::apply_relationship_patch(&mut conn, &patch)
 }
 
 #[tauri::command]
