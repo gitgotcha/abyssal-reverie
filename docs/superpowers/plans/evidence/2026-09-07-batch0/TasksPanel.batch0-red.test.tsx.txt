@@ -1,0 +1,162 @@
+/**
+ * 批次 0 红灯证据载体（执行计划任务 0.5 / 0.6）—— 独立拆分用例，预期 3 failed / 3 passed。
+ *
+ * 留存规则（执行计划 §0 + Codex 复核 2026-09-07）：红灯只记证据于批报告，不落持久提交；
+ * 每个提交点必须全绿。因此本文件：
+ *   - 短暂留存于主工作树捕获证据后，即移出 vitest 测试发现范围
+ *     （证据存档：docs/superpowers/plans/evidence/2026-09-07-batch0/）；
+ *   - 批次 1（任务 1.1/1.9，红灯②转绿）与批次 2（任务 2.1，红灯①转绿）在开发
+ *     工作树内以正式用例完成红→绿，届时可参照本文件的断言设计。
+ *
+ * 拆分原则（Codex 复核纠正①）：同一 it 内前一个断言失败会遮住后一个断言，
+ * 故每条断言独立成测——sanity 也独立（0.5-a），确保红灯归因精确。
+ *
+ * 红灯①（0.5）：设置 1 分钟时，新建面板提示应等于 60s 等价文案。
+ *   现行缺陷：TasksPanel.tsx:87 `minutePerPomodoro = projects.length >= 0 ? 25 : 25`
+ *   恒为 25，提示（247 行 `个番茄 = {formPomodoro * minutePerPomodoro} 分钟`）不受
+ *   已保存设置影响。实际预算（FakeAppGateway.ts:490）本就按 settings 派生。
+ * 红灯②（0.6）：标题-only 创建后 tag_id / priority 均应为 NULL。
+ *   现行缺陷：TasksPanel.tsx:85 `effectiveTagId = formTagId || fallbackId` 自动填
+ *   「其他」；同文件 69 行 priority 默认 'med'。另发现 FakeAppGateway.ts:495 也
+ *   写死 `tagId: 'system-other'`（第二处填充点，批次 1 需一并处理）。
+ */
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import App from '../../../App'
+import { DEFAULT_SETTINGS } from '../../../domain/defaults'
+import type { CreateTaskInput, Tag } from '../../../domain/models'
+import { GatewayProvider } from '../../../services/gatewayContext'
+import { FakeAppGateway } from '../../../test/FakeAppGateway'
+import { TasksPanel } from '../TasksPanel'
+
+afterEach(() => cleanup())
+
+// ─── 红灯①（0.5）：App 级，三条独立用例 ─────────────────────────────────────
+
+describe('批次 0 红灯 0.5：新建提示与预算应由已保存设置派生', () => {
+  // 0.5-a（预期绿）：网关契约 sanity 独立成测 —— 0.5-b/c 的 setup 前提由此单独验证，
+  // 不再内联在红灯断言之前（避免 sanity 失败遮住真正的目标断言归因）。
+  it('0.5-a sanity：saveSettings 保存 1 分钟后返回值反映新设置与新 idle 时长', async () => {
+    const gateway = new FakeAppGateway()
+    const saved = await gateway.saveSettings({ ...DEFAULT_SETTINGS, focusDurationMinutes: 1, updatedAt: Date.now() })
+    expect(saved.settings.focusDurationMinutes).toBe(1)
+    expect(saved.timer.durationSeconds).toBe(60)
+  })
+
+  // 0.5-b（预期红）：显示层缺陷 —— 提示恒 25 分钟（TasksPanel.tsx:87），不读已保存设置。
+  it('0.5-b 设置 1 分钟时，创建面板换算提示应显示「个番茄 = 1 分钟」', async () => {
+    const gateway = new FakeAppGateway()
+    await gateway.saveSettings({ ...DEFAULT_SETTINGS, focusDurationMinutes: 1, updatedAt: Date.now() })
+    const user = userEvent.setup()
+    render(
+      <GatewayProvider gateway={gateway}>
+        <App />
+      </GatewayProvider>,
+    )
+    await user.click(screen.getByRole('button', { name: '任务' }))
+    await screen.findByPlaceholderText('添加任务…')
+    const hint = await screen.findByText(
+      (_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('个番茄 =') ?? false),
+    )
+    // 🔴 当前恒为 '个番茄 = 25 分钟'
+    expect(hint.textContent).toBe('个番茄 = 1 分钟')
+  })
+
+  // 0.5-c（预期绿）：预算层本就按设置派生（FakeAppGateway.ts:490）——
+  // 独立成测以精确归位缺陷：只坏在显示层，不坏在预算层。
+  it('0.5-c 设置 1 分钟时，实际创建的任务预算应等于 60 秒', async () => {
+    const gateway = new FakeAppGateway()
+    await gateway.saveSettings({ ...DEFAULT_SETTINGS, focusDurationMinutes: 1, updatedAt: Date.now() })
+    const user = userEvent.setup()
+    render(
+      <GatewayProvider gateway={gateway}>
+        <App />
+      </GatewayProvider>,
+    )
+    await user.click(screen.getByRole('button', { name: '任务' }))
+    const input = await screen.findByPlaceholderText('添加任务…')
+    await user.type(input, '一分钟任务')
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(gateway.currentTasks).toHaveLength(1))
+    expect(gateway.currentTasks[0].targetSeconds).toBe(60)
+  })
+})
+
+// ─── 红灯②（0.6）：TasksPanel 级 payload，三条独立用例 ──────────────────────
+
+const fallbackTag: Tag = {
+  id: 'system-other',
+  name: '其他',
+  kind: 'system',
+  isFallback: true,
+  sortOrder: 0,
+  createdAt: 0,
+  updatedAt: 0,
+}
+
+/** 独立渲染 + 仅标题创建，返回 onCreateTask 收到的 payload（每个用例独立调用，互不遮蔽）。 */
+async function createOnlyByTitle(): Promise<CreateTaskInput> {
+  const onCreateTask = vi.fn(async () => undefined)
+  const user = userEvent.setup()
+  render(
+    <TasksPanel
+      tasks={[]}
+      categories={[]}
+      projects={[]}
+      progress={{}}
+      tags={[fallbackTag]}
+      onCreateTask={onCreateTask as unknown as (input: unknown) => Promise<unknown>}
+      onToggleTask={vi.fn()}
+      onCyclePriority={vi.fn()}
+      onArchiveTask={vi.fn(async () => undefined)}
+      onStartFocus={vi.fn()}
+      onCompleteTask={vi.fn(async () => undefined)}
+      onUpdateTask={vi.fn(async () => undefined)}
+      tagOps={{
+        createTag: vi.fn(),
+        renameTag: vi.fn(),
+        reorderTag: vi.fn(),
+        previewDeleteTag: vi.fn(async () => ({ tagId: 'x', affectedTasks: 0 })),
+        deleteTag: vi.fn(),
+      }}
+      projectOps={{
+        createProject: vi.fn(),
+        renameProject: vi.fn(),
+        archiveProject: vi.fn(),
+        createCategory: vi.fn(),
+        renameCategory: vi.fn(),
+        archiveCategory: vi.fn(),
+        moveProject: vi.fn(),
+      }}
+    />,
+  )
+  const input = screen.getByPlaceholderText('添加任务…')
+  await user.type(input, '标题-only 创建')
+  await user.click(screen.getByRole('button', { name: '添加任务' }))
+  await waitFor(() => expect(onCreateTask).toHaveBeenCalledTimes(1))
+  return onCreateTask.mock.calls[0][0] as CreateTaskInput
+}
+
+describe('批次 0 红灯 0.6：标题-only 创建应落 NULL，不自动填保底标签', () => {
+  // 0.6-a（预期绿）：projectId 未选择即不传（当前已满足）。
+  it('0.6-a 仅标题创建时 payload.projectId 为 undefined', async () => {
+    const payload = await createOnlyByTitle()
+    expect(payload.projectId).toBeUndefined()
+  })
+
+  // 0.6-b（预期红）：tagId 当前自动填「其他」（TasksPanel.tsx:85 effectiveTagId fallback）。
+  it('0.6-b 仅标题创建时 payload.tagId 应为 null', async () => {
+    const payload = await createOnlyByTitle()
+    // 🔴 当前为 'system-other'
+    expect(payload.tagId ?? null).toBeNull()
+  })
+
+  // 0.6-c（预期红）：priority 当前默认 'med'（TasksPanel.tsx:69）。
+  it('0.6-c 仅标题创建时 payload.priority 应为 null', async () => {
+    const payload = await createOnlyByTitle()
+    // 🔴 当前为 'med'
+    expect(payload.priority ?? null).toBeNull()
+  })
+})

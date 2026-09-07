@@ -1,0 +1,25 @@
+/* Original product palette; refined management hierarchy. */
+:root{--ink:#e2efef;--muted:rgba(195,212,218,.8);--faint:#98aab2;--accent:#b0c0c6;--panel:rgba(8,13,18,.36);--line:rgba(215,228,230,.10)}
+.glass{backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-radius:16px;box-shadow:inset 0 .5px rgba(215,228,230,.04),0 4px 16px rgba(2,3,5,.16)}
+.ocean:after{background:rgba(3,8,13,.27)}
+.glass{position:relative}
+.glass:has(.management-categories) #toolbar,.glass:has(.management-categories) #workspace{margin-left:138px}
+.management-categories{position:absolute;left:0;top:92px;bottom:54px;width:138px;display:flex;flex-direction:column;gap:8px;padding:12px;align-items:stretch;border-right:1px solid var(--line)}
+.management-categories .category{justify-content:flex-start;padding:10px 13px;flex-shrink:0}
+.category{padding:8px 20px;color:var(--muted);border:1px solid transparent;min-height:42px}
+.category.active{color:var(--ink);background:rgba(176,192,198,.12);border-color:rgba(215,228,230,.13)}
+header{padding-bottom:14px}.row{padding-top:19px;padding-bottom:19px}.row.selected{background:rgba(176,192,198,.11)}
+.detail{background:rgba(8,13,18,.15);gap:24px}.detail h2{font-size:20px;line-height:1.65}
+button{transition:background-color 150ms ease-out,color 150ms ease-out,border-color 150ms ease-out}
+.primary{background:rgba(176,192,198,.16)}.nav.active{background:rgba(176,192,198,.12)}
+dialog{background:rgba(10,17,23,.96)}select option{background:#0a1117;color:#e2efef}
+dialog[open]{animation:dialog-appear 150ms ease-out}dialog::backdrop{animation:dialog-appear 150ms ease-out}
+@keyframes dialog-appear{from{opacity:0}to{opacity:1}}
+.subtitle:empty{display:none}.category svg{width:17px;height:17px}
+@media(max-width:850px){.detail{background:rgba(10,17,23,.97)}.category{padding:8px 12px}.management-categories{gap:4px}}
+@media(prefers-reduced-motion:reduce){dialog[open],dialog::backdrop{animation:none!important}}
+@media(max-width:1100px){.management-categories{width:110px;padding:10px 7px}.glass:has(.management-categories) #toolbar,.glass:has(.management-categories) #workspace{margin-left:110px}.management-categories .category{padding:10px 8px;gap:6px}}
+@media(max-width:600px){.management-categories{width:80px;padding:8px 4px}.management-categories .category{flex-direction:column;font-size:12px;gap:3px}.glass:has(.management-categories) #toolbar,.glass:has(.management-categories) #workspace{margin-left:80px}.tabs{gap:6px;flex-wrap:wrap}.tab{font-size:12px}#toolbar{padding:0 12px}header{padding:16px}.searchbox input{font-size:13px}}
+.date-popover{display:none;position:fixed;z-index:30;inset:auto 38px 76px auto;width:min(360px,calc(100vw - 32px));padding:18px;border:1px solid rgba(205,230,238,.2);border-radius:16px;background:rgba(10,17,23,.96);box-shadow:0 22px 70px #000a;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
+.date-popover.open{display:block}.date-head,.date-quick,.manual-date>div{display:flex;align-items:center;gap:8px}.date-head{justify-content:space-between;margin-bottom:12px}.date-head strong{font-weight:500}.date-week,.date-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}.date-week span{text-align:center;color:var(--faint);font-size:11px;padding:3px}.date-cell{min-height:36px;padding:4px;border:1px solid transparent}.date-cell.today{border-color:rgba(184,216,224,.4)}.date-cell.today:after{content:'·';margin-left:2px}.date-cell.selected{background:rgba(184,216,224,.23);color:var(--ink)}.date-cell.cursor{outline:1px solid rgba(184,216,224,.55);outline-offset:-2px}.date-quick{margin:14px 0 12px;border-top:1px solid var(--line);padding-top:12px;flex-wrap:wrap}.date-quick button{min-height:32px;padding:5px 9px;color:var(--muted)}.manual-date{display:grid;gap:5px}.manual-date>label{font-size:12px;color:var(--muted)}.manual-date>div input{flex:1;width:100%}.manual-date .error{display:block;min-height:18px}.tag-undo-banner{position:fixed;z-index:25;right:28px;bottom:84px;width:min(430px,calc(100vw - 32px));display:flex;flex-direction:row;align-items:center;gap:12px;padding:14px 16px;border:1px solid rgba(205,230,238,.2);border-radius:14px;background:rgba(10,17,23,.96);box-shadow:0 18px 55px #0008;backdrop-filter:blur(22px);font-size:13px}.tag-undo-banner span{flex:1}.retry-save{margin-left:10px;min-height:30px;padding:4px 10px}
+@media(max-width:600px){.date-popover{inset:auto 16px 72px 16px;width:auto}.tag-undo-banner{right:16px;bottom:72px;left:16px;width:auto;align-items:flex-start;flex-direction:column}}

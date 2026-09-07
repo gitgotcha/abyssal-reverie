@@ -1,0 +1,72 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90mD:/Project/abyssal-reverie/Abyssal Reverie[39m
+
+ [31m❯[39m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx [2m([22m[2m6 tests[22m[2m | [22m[31m3 failed[39m[2m)[22m[33m 1791[2mms[22m[39m
+     [32m✓[39m 0.5-a sanity：saveSettings 保存 1 分钟后返回值反映新设置与新 idle 时长[32m 2[2mms[22m[39m
+[31m     [31m×[31m 0.5-b 设置 1 分钟时，创建面板换算提示应显示「个番茄 = 1 分钟」[39m[33m 560[2mms[22m[39m
+     [33m[2m✓[22m[39m 0.5-c 设置 1 分钟时，实际创建的任务预算应等于 60 秒 [33m 337[2mms[22m[39m
+     [33m[2m✓[22m[39m 0.6-a 仅标题创建时 payload.projectId 为 undefined [33m 326[2mms[22m[39m
+[31m     [31m×[31m 0.6-b 仅标题创建时 payload.tagId 应为 null[39m[32m 298[2mms[22m[39m
+[31m     [31m×[31m 0.6-c 仅标题创建时 payload.priority 应为 null[39m[32m 263[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 3 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx[2m > [22m批次 0 红灯 0.5：新建提示与预算应由已保存设置派生[2m > [22m0.5-b 设置 1 分钟时，创建面板换算提示应显示「个番茄 = 1 分钟」
+[31m[1mAssertionError[22m: expected '个番茄 = 25 分钟' to be '个番茄 = 1 分钟' // Object.is equality[39m
+
+Expected: [32m"个番茄 = [7m1[27m 分钟"[39m
+Received: [31m"个番茄 = [7m25[27m 分钟"[39m
+
+[36m [2m❯[22m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx:[2m64:30[22m[39m
+    [90m 62|[39m     )
+    [90m 63|[39m     [90m// 🔴 当前恒为 '个番茄 = 25 分钟'[39m
+    [90m 64|[39m     [34mexpect[39m(hint[33m.[39mtextContent)[33m.[39m[34mtoBe[39m([32m'个番茄 = 1 分钟'[39m)
+    [90m   |[39m                              [31m^[39m
+    [90m 65|[39m   })
+    [90m 66|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx[2m > [22m批次 0 红灯 0.6：标题-only 创建应落 NULL，不自动填保底标签[2m > [22m0.6-b 仅标题创建时 payload.tagId 应为 null
+[31m[1mAssertionError[22m: expected 'system-other' to be null[39m
+
+[32m- Expected:[39m
+null
+
+[31m+ Received:[39m
+"system-other"
+
+[36m [2m❯[22m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx:[2m153:35[22m[39m
+    [90m151|[39m     [35mconst[39m payload [33m=[39m [35mawait[39m [34mcreateOnlyByTitle[39m()
+    [90m152|[39m     [90m// 🔴 当前为 'system-other'[39m
+    [90m153|[39m     [34mexpect[39m(payload[33m.[39mtagId [33m??[39m [35mnull[39m)[33m.[39m[34mtoBeNull[39m()
+    [90m   |[39m                                   [31m^[39m
+    [90m154|[39m   })
+    [90m155|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx[2m > [22m批次 0 红灯 0.6：标题-only 创建应落 NULL，不自动填保底标签[2m > [22m0.6-c 仅标题创建时 payload.priority 应为 null
+[31m[1mAssertionError[22m: expected 'med' to be null[39m
+
+[32m- Expected:[39m
+null
+
+[31m+ Received:[39m
+"med"
+
+[36m [2m❯[22m src/features/tasks/__tests__/TasksPanel.batch0-red.test.tsx:[2m160:38[22m[39m
+    [90m158|[39m     [35mconst[39m payload [33m=[39m [35mawait[39m [34mcreateOnlyByTitle[39m()
+    [90m159|[39m     [90m// 🔴 当前为 'med'[39m
+    [90m160|[39m     [34mexpect[39m(payload[33m.[39mpriority [33m??[39m [35mnull[39m)[33m.[39m[34mtoBeNull[39m()
+    [90m   |[39m                                      [31m^[39m
+    [90m161|[39m   })
+    [90m162|[39m })
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m3 failed[39m[22m[2m | [22m[1m[32m3 passed[39m[22m[90m (6)[39m
+[2m   Start at [22m 15:58:54
+[2m   Duration [22m 10.20s[2m (transform 676ms, setup 1.55s, import 1.03s, tests 1.79s, environment 4.95s)[22m
