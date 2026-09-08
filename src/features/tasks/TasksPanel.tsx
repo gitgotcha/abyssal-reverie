@@ -1,6 +1,6 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
-  Category, CreateTaskInput, Project, Tag, TagDeletePreview, Task, TaskPriority, TaskProgress,
+  Category, CreateTaskInput, Project, RelationshipPatch, Tag, TagDeletePreview, Task, TaskPriority, TaskProgress,
   UpdateTaskInput,
 } from "../../domain/models";
 import { C, CARD } from "../shared/palette";
@@ -8,12 +8,18 @@ import { HorizonDivider } from "../timer/GoalRing";
 import { TagManager } from "../tags/TagManager";
 import { TaskDetailDialog } from "./TaskDetailDialog";
 import { ProjectManager } from "./ProjectManager";
+import { todayLocalDate } from "../../domain/localDate";
+import { searchEntities } from "../../domain/search";
+import { DatePicker } from "../../components/DatePicker";
+import type { ManagementState, ManagementTaskStatus } from "../management/managementState";
+import { SearchablePicker, type PickerOption } from "../shared/SearchablePicker";
 
-function PriorityPip({ p }: { p: TaskPriority }) {
+function PriorityPip({ p }: { p: TaskPriority | null }) {
   const colors: Record<TaskPriority, string> = {
     high: "rgba(190,120,120,0.80)", med: "rgba(170,145,108,0.80)", low: "rgba(158,173,178,0.70)",
   };
-  return <span style={{ width: 5, height: 5, borderRadius: "50%", background: colors[p], display: "inline-block", flexShrink: 0 }} />;
+  // v5: null = 未设置 → hollow dot instead of a colored pip.
+  return <span style={{ width: 5, height: 5, borderRadius: "50%", background: p ? colors[p] : "transparent", border: p ? "none" : "1px solid rgba(200,214,216,0.40)", display: "inline-block", flexShrink: 0 }} />;
 }
 
 export const PRIORITY_LABELS: Record<TaskPriority, string> = { high: "高", med: "中", low: "低" };
@@ -29,14 +35,19 @@ export function formatProgressLine(task: Task, progress?: TaskProgress): string 
 }
 
 export function TasksPanel({
-  tasks, tags, categories, projects, progress, onCreateTask, onToggleTask, onArchiveTask,
-  onStartFocus, onCompleteTask, onCyclePriority, onUpdateTask, onNotify, tagOps, projectOps,
+  tasks, tags, categories, projects, progress, focusDurationMinutes, onCreateTask, onToggleTask,
+  onArchiveTask, onStartFocus, onCompleteTask, onCyclePriority, onUpdateTask, onApplyTaskRelationship, onNotify, tagOps,
+  projectOps, showManagementActions = true,
+  initialSearch = "", initialStatusFilter = "todo", initialTagFilter = "all", initialScrollTop = 0,
+  onManagementStateChange,
 }: {
   tasks: Task[];
   tags: Tag[];
   categories: Category[];
   projects: Project[];
   progress: Record<string, TaskProgress>;
+  /** 任务 2.1：已保存的专注时长（分钟）——新建换算提示的唯一来源，杜绝写死 25。 */
+  focusDurationMinutes: number;
   onCreateTask: (input: CreateTaskInput) => Promise<unknown>;
   onToggleTask: (id: string) => Promise<unknown>;
   onArchiveTask: (id: string, archived: boolean) => Promise<unknown>;
@@ -44,7 +55,14 @@ export function TasksPanel({
   onCompleteTask: (taskId: string) => Promise<unknown>;
   onCyclePriority: (id: string) => Promise<unknown>;
   onUpdateTask: (input: UpdateTaskInput) => Promise<unknown>;
+  onApplyTaskRelationship: (patch: RelationshipPatch) => Promise<unknown>;
   onNotify?: (message: string) => void;
+  showManagementActions?: boolean;
+  initialSearch?: string;
+  initialStatusFilter?: ManagementTaskStatus;
+  initialTagFilter?: string;
+  initialScrollTop?: number;
+  onManagementStateChange?: (patch: Partial<Pick<ManagementState, "taskSearch" | "taskStatusFilter" | "taskTagFilter" | "taskScrollTop">>) => void;
   tagOps: {
     createTag: (name: string) => Promise<unknown>;
     renameTag: (id: string, name: string) => Promise<unknown>;
@@ -66,25 +84,58 @@ export function TasksPanel({
   const [newTitle, setNewTitle] = useState("");
   const [formTagId, setFormTagId]   = useState("");
   const [formProjectId, setFormProjectId] = useState("");
-  const [formPriority, setFormPriority] = useState<TaskPriority>("med");
+  const [formPriority, setFormPriority] = useState<TaskPriority | "">("");
   const [formPomodoro, setFormPomodoro] = useState(1);
   const [formDeadline, setFormDeadline] = useState("");
   const [formNotes, setFormNotes] = useState("");
   const [moreOpen, setMoreOpen] = useState(false);
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all"|"todo"|"done">("todo");
-  const [tagFilter, setTagFilter]     = useState<string>("all");
+  const [search, setSearch] = useState(initialSearch);
+  const [statusFilter, setStatusFilter] = useState<ManagementTaskStatus>(initialStatusFilter);
+  const [tagFilter, setTagFilter]     = useState<string>(initialTagFilter);
   const [managerOpen, setManagerOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [today, setToday] = useState(() => todayLocalDate());
   const inputRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
-  const fallbackId = tags.find(t => t.isFallback)?.id ?? "system-other";
-  const effectiveTagId = formTagId || fallbackId;
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = initialScrollTop;
+  }, [initialScrollTop]);
 
-  const minutePerPomodoro = useMemo(() => projects.length >= 0 ? 25 : 25, [projects]);
+  useEffect(() => {
+    onManagementStateChange?.({ taskSearch: search, taskStatusFilter: statusFilter, taskTagFilter: tagFilter });
+  }, [search, statusFilter, tagFilter]);
+
+  // Deadline state must refresh even while the page is otherwise idle. The
+  // local-midnight timer covers an open window; visibility/focus refreshes
+  // cover sleep, hibernation and tray-to-window restoration.
+  useEffect(() => {
+    let timer: number | undefined;
+    const scheduleMidnightRefresh = () => {
+      setToday(todayLocalDate());
+      const now = new Date();
+      const next = new Date(now);
+      next.setHours(24, 0, 0, 0);
+      timer = window.setTimeout(scheduleMidnightRefresh, Math.max(1000, next.getTime() - now.getTime() + 50));
+    };
+    const refreshOnVisible = () => {
+      if (!document.hidden) setToday(todayLocalDate());
+    };
+    scheduleMidnightRefresh();
+    document.addEventListener("visibilitychange", refreshOnVisible);
+    window.addEventListener("focus", refreshOnVisible);
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", refreshOnVisible);
+      window.removeEventListener("focus", refreshOnVisible);
+    };
+  }, []);
+
+  // 任务 2.1（红灯①转绿）：提示由已保存设置权威派生（原 `projects.length >= 0 ? 25 : 25`）。
+  const minutePerPomodoro = focusDurationMinutes;
 
   const addTask = async () => {
     if (submitting) return;
@@ -93,9 +144,9 @@ export function TasksPanel({
     try {
       await onCreateTask({
         title,
-        tagId: effectiveTagId,
         projectId: formProjectId || undefined,
-        priority: formPriority,
+        tagId: formTagId || undefined,
+        priority: formPriority || undefined,
         pomodoroTarget: Math.max(1, Math.min(99, formPomodoro || 1)),
         deadline: formDeadline || undefined,
         notes: formNotes || undefined,
@@ -112,23 +163,27 @@ export function TasksPanel({
   };
 
   const tagName = (id: string | null) => (id ? tags.find(t => t.id === id)?.name : undefined);
+  const projectOptions: PickerOption[] = categories.filter(c => c.status === "active").flatMap(category =>
+    projects.filter(project => project.categoryId === category.id && project.status !== "archived")
+      .map(project => ({ value: project.id, label: project.name, group: category.name }))
+  );
+  const tagOptions: PickerOption[] = tags.map(tag => ({ value: tag.id, label: tag.name }));
 
   // Combined filtering: keyword / status / tag. Scroll position is preserved
   // because the list container never unmounts across filter tweaks.
   const filtered = useMemo(() => {
-    const kw = search.trim().toLowerCase();
-    return tasks.filter(t => {
+    const kw = search.trim();
+    const candidates = tasks.filter(t => {
       if (t.status === "archived" && statusFilter !== "all") return false;
       if (statusFilter === "todo" && (t.status === "done" || t.status === "archived")) return false;
       if (statusFilter === "done" && t.status !== "done") return false;
       if (tagFilter !== "all" && t.tagId !== tagFilter) return false;
-      if (kw) {
-        const hay = `${t.title} ${t.project}`.toLowerCase();
-        if (!hay.includes(kw)) return false;
-      }
       return true;
     });
-  }, [tasks, search, statusFilter, tagFilter]);
+    return kw
+      ? searchEntities(candidates, kw, t => [t.title, t.project, tagName(t.tagId) ?? ""], t => t.id)
+      : candidates;
+  }, [tasks, tags, search, statusFilter, tagFilter]);
   const filtersActive = search.trim() !== "" || statusFilter !== "todo" || tagFilter !== "all";
 
   const detailTask = tasks.find(t => t.id === detailId) ?? null;
@@ -149,7 +204,7 @@ export function TasksPanel({
             background: C.cardDim, border: `1px solid ${C.hairline}`,
             borderRadius: 5, padding: "2px 6px",
           }}>{tasks.filter(t => t.status === "todo").length}</span>
-          <button onClick={() => setProjectOpen(true)} className="btn-filter"
+          {showManagementActions && <button onClick={() => setProjectOpen(true)} className="btn-filter"
             title="创建项目与类别"
             style={{
               marginLeft: "auto", fontFamily: "var(--font-sans)", fontSize: 10,
@@ -157,8 +212,8 @@ export function TasksPanel({
               border: `0.5px solid ${C.hairlineStr}`,
               background: "rgba(27,37,44,0.30)",
               color: C.moonlight, cursor: "pointer",
-            }}>管理项目</button>
-          <button onClick={() => setManagerOpen(true)} className="btn-filter"
+            }}>管理项目</button>}
+          {showManagementActions && <button onClick={() => setManagerOpen(true)} className="btn-filter"
             title="创建、重命名、排序或删除标签"
             style={{
               fontFamily: "var(--font-sans)", fontSize: 10,
@@ -166,7 +221,7 @@ export function TasksPanel({
               border: `0.5px solid ${C.hairlineStr}`,
               background: "rgba(27,37,44,0.30)",
               color: C.moonlight, cursor: "pointer",
-            }}>管理标签</button>
+            }}>管理标签</button>}
           <div style={{ display: "flex", gap: 3 }}>
             {([["todo","待办"],["done","已完成"],["all","全部"]] as const).map(([f, label]) => (
               <button key={f} onClick={() => setStatusFilter(f)} className="btn-filter"
@@ -222,19 +277,13 @@ export function TasksPanel({
           </button>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 22px 9px", flexWrap: "wrap" }}>
-          <select value={formProjectId} onChange={e => setFormProjectId(e.target.value)}
-            aria-label="所属项目" style={{ ...smallField, minWidth: 96 }}>
-            <option value="">独立任务</option>
-            {categories.filter(c => c.status === "active").map(cat => (
-              <optgroup key={cat.id} label={cat.name}>
-                {projects.filter(p => p.categoryId === cat.id && p.status !== "archived").map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+          <span style={{ width: 126, flexShrink: 0 }}>
+            <SearchablePicker value={formProjectId} onChange={setFormProjectId} options={projectOptions}
+              ariaLabel="所属项目" emptyLabel="独立任务" placeholder="搜索项目…" />
+          </span>
           <select value={formPriority} onChange={e => setFormPriority(e.target.value as TaskPriority)}
             aria-label="优先级" style={{ ...smallField, minWidth: 64 }}>
+            <option value="">未设置</option>
             <option value="high">高</option>
             <option value="med">中</option>
             <option value="low">低</option>
@@ -258,14 +307,15 @@ export function TasksPanel({
         </div>
         {moreOpen && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 22px 9px", flexWrap: "wrap" }}>
-            <select value={formTagId} onChange={e => setFormTagId(e.target.value)}
-              aria-label="任务标签" style={{ ...smallField, minWidth: 74 }}>
-              {tags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-            </select>
+            <span style={{ width: 126, flexShrink: 0 }}>
+              <SearchablePicker value={formTagId} onChange={setFormTagId} options={tagOptions}
+                ariaLabel="任务标签" emptyLabel="未设置" placeholder="搜索标签…" />
+            </span>
             <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)" }}>
               截止
-              <input type="date" value={formDeadline} onChange={e => setFormDeadline(e.target.value)}
-                aria-label="截止日期" style={{ ...smallField }} />
+              <span style={{ width: 142 }}>
+                <DatePicker value={formDeadline} onChange={setFormDeadline} />
+              </span>
             </label>
             <input value={formNotes} onChange={e => setFormNotes(e.target.value)}
               placeholder="备注" aria-label="备注"
@@ -275,7 +325,9 @@ export function TasksPanel({
         <HorizonDivider />
       </div>
 
-      <div className="flex-1 overflow-y-auto" style={{ padding: "6px 22px" }}>
+      <div ref={listRef} className="flex-1 overflow-y-auto" onScroll={event => {
+        onManagementStateChange?.({ taskScrollTop: event.currentTarget.scrollTop });
+      }} style={{ padding: "6px 22px" }}>
         {tasks.length === 0 ? (
           <EmptyHint text="还没有任务，添加第一个吧" />
         ) : filtered.length === 0 ? (
@@ -297,6 +349,7 @@ export function TasksPanel({
               const prog = progress[task.id];
               const line = formatProgressLine(task, prog);
               const pct = prog ? Math.round(prog.progress * 100) : 0;
+              const overdue = Boolean(task.deadline && task.deadline < today && !task.done && task.status !== "archived");
               return (
               <div key={task.id} className="slide-in task-item"
                 style={{ display:"flex", alignItems:"center", gap:9, padding:"9px 12px", ...CARD, flexWrap:"wrap" }}>
@@ -315,8 +368,8 @@ export function TasksPanel({
                   )}
                 </button>
                 <button onClick={() => void onCyclePriority(task.id)}
-                  title={`优先级：${PRIORITY_LABELS[task.priority]}`}
-                  aria-label={`切换优先级，当前${PRIORITY_LABELS[task.priority]}`}
+                  title={`优先级：${task.priority ? PRIORITY_LABELS[task.priority] : "未设置"}`}
+                  aria-label={`切换优先级，当前${task.priority ? PRIORITY_LABELS[task.priority] : "未设置"}`}
                   style={{ background:"none", border:"none", cursor:"pointer", padding:0, display:"flex" }}>
                   <PriorityPip p={task.priority} />
                 </button>
@@ -334,7 +387,7 @@ export function TasksPanel({
                     textDecorationColor: "rgba(165,182,188,0.26)",
                     display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
                     overflow: "hidden",
-                    transition: "all 0.22s",
+                    transition: "color 0.22s, opacity 0.22s, transform 0.22s",
                   }}>{task.title}</span>
                   {line && (
                     <span style={{ display:"flex", alignItems:"center", gap:6 }}>
@@ -353,8 +406,9 @@ export function TasksPanel({
                 </button>
                 {task.deadline && (
                   <span style={{
-                    fontFamily:"var(--font-mono)", fontSize:9, color:C.textMuted, flexShrink:0,
-                  }}>{task.deadline.slice(5)}</span>
+                    fontFamily:"var(--font-mono)", fontSize:9,
+                    color: overdue ? "rgba(231,164,145,0.95)" : C.textMuted, flexShrink:0,
+                  }}>{overdue ? "逾期 · " : ""}{task.deadline.slice(5)}</span>
                 )}
                 {taskTagName && (
                   <span title={`标签：${taskTagName}`} style={{
@@ -423,13 +477,18 @@ export function TasksPanel({
           progress={progress[detailTask.id]}
           categories={categories}
           projects={projects}
+          tags={tags}
           onClose={() => setDetailId(null)}
           onSave={async patch => {
             await onUpdateTask({ id: detailTask.id, ...patch });
           }}
+          onApplyRelationship={onApplyTaskRelationship}
           onToggleDone={() => void onToggleTask(detailTask.id)}
           onArchive={() => void onArchiveTask(detailTask.id, true)}
-          onComplete={async () => { await onCompleteTask(detailTask.id); }}
+          onComplete={async () => {
+            await onCompleteTask(detailTask.id);
+            setDetailId(null);
+          }}
         />
       )}
     </div>

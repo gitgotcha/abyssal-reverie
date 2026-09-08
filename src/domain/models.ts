@@ -9,7 +9,7 @@ export interface Task {
   title: string
   done: boolean
   pomodoroTarget: number
-  priority: TaskPriority
+  priority: TaskPriority | null
   /** Resolved display project name (通用 for standalone tasks). */
   project: string
   /** v1.2: owning project row (null = standalone). */
@@ -24,12 +24,13 @@ export interface Task {
   deadline: string | null
   /** v1.2: free notes. */
   notes: string
-  /** Owning primary tag. v1.1: always present on Rust payloads. */
-  tagId: string
+  /** Owning primary tag; null means the user did not choose one. */
+  tagId: string | null
   sortOrder: number
   createdAt: number
   updatedAt: number
   completedAt: number | null
+  relationshipRevision: number
 }
 
 export interface AppSettings {
@@ -151,6 +152,7 @@ export interface CommandError {
 
 /** R06: read-only preview of a pending v3 → v4 semantic migration. */
 export interface MigrationPreview {
+  migrationKind: 'legacySemantic' | 'nullableMetadata'
   schemaVersion: number
   taskCount: number
   sessionCount: number
@@ -187,17 +189,40 @@ export interface FinishTimerResult {
 export interface CreateTaskInput {
   title: string
   pomodoroTarget: number
-  priority: TaskPriority
+  priority?: TaskPriority | null
   /** v1.2: owning project id (omit/empty = standalone task). */
-  projectId?: string
+  projectId?: string | null
   /** Legacy free-text project (pre-v1.2 callers). */
   project?: string
   /** v1.2: ISO date string. */
-  deadline?: string
+  deadline?: string | null
   /** v1.2: free notes. */
   notes?: string
-  /** Defaults to the fallback tag when omitted. */
-  tagId?: string
+  /** Omit or pass null to leave the task without a tag. */
+  tagId?: string | null
+}
+
+export interface TaskMetadata {
+  projectId: string | null
+  tagId: string | null
+  priority: TaskPriority | null
+  deadline: string | null
+}
+
+export type NullablePatch<T> =
+  | { action: 'keep' }
+  | { action: 'clear' }
+  | { action: 'set'; value: T }
+
+export interface RelationshipPatch {
+  taskId: string
+  expectedRevision: number
+  project: NullablePatch<string>
+  tag: NullablePatch<string>
+  /** v1.4：所有可选元数据都通过同一原子补丁处理。 */
+  priority: NullablePatch<TaskPriority>
+  deadline: NullablePatch<string>
+  notes: NullablePatch<string>
 }
 
 export interface UpdateTaskInput extends Partial<CreateTaskInput> {

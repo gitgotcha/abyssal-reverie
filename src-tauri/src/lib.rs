@@ -98,6 +98,7 @@ pub fn run() {
             // writes), then either open ready-to-run, refuse a future schema,
             // or open in MIGRATION-PREP mode for an old schema.
             let probe_version = db::probe_schema_version(&db_path).unwrap_or(None);
+            let mut migration_pending = false;
             let conn = match probe_version {
                 Some(v) if v > db::LATEST_SCHEMA_VERSION => {
                     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -114,12 +115,8 @@ pub fn run() {
                 // Old schema: open WITHOUT migrating — the user confirms the
                 // semantic migration (budget basis, 通用 mapping) first.
                 Some(v) if v > 0 && v < db::LATEST_SCHEMA_VERSION => {
-                    let conn = db::open_prepared(&db_path)?;
-                    app.manage(AppState {
-                        db: Mutex::new(conn),
-                        migration_pending: std::sync::atomic::AtomicBool::new(true),
-                    });
-                    return Ok(());
+                    migration_pending = true;
+                    db::open_prepared(&db_path)?
                 }
                 // Latest schema or fresh install.
                 _ => match db::open_at(&db_path) {
@@ -141,7 +138,7 @@ pub fn run() {
             };
             app.manage(AppState {
                 db: Mutex::new(conn),
-                migration_pending: std::sync::atomic::AtomicBool::new(false),
+                migration_pending: std::sync::atomic::AtomicBool::new(migration_pending),
             });
 
             tray::build_tray(app.handle())?;

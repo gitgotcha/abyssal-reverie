@@ -20,7 +20,9 @@ const fallbackTag: Tag = {
 function renderPanel(overrides: {
   onCreateTask?: ReturnType<typeof vi.fn>
   onNotify?: ReturnType<typeof vi.fn>
+  focusDurationMinutes?: number
 } = {}) {
+  const { focusDurationMinutes = 25 } = overrides
   const onCreateTask = overrides.onCreateTask ?? vi.fn(async () => {
     const task: Task = {
       id: 'task-1',
@@ -35,11 +37,12 @@ function renderPanel(overrides: {
       status: 'todo',
       deadline: null,
       notes: '',
-      tagId: 'system-other',
+      tagId: null,
       sortOrder: 0,
       createdAt: 0,
       updatedAt: 0,
       completedAt: null,
+      relationshipRevision: 0,
     }
     return task
   })
@@ -50,6 +53,7 @@ function renderPanel(overrides: {
       categories={[]}
       projects={[]}
       progress={{}}
+      focusDurationMinutes={focusDurationMinutes}
       tags={[fallbackTag]}
       onCreateTask={onCreateTask as unknown as (input: unknown) => Promise<unknown>}
       onToggleTask={vi.fn()}
@@ -59,6 +63,7 @@ function renderPanel(overrides: {
       onCompleteTask={vi.fn(async () => undefined)}
       onUpdateTask={vi.fn(async () => undefined)}
       onNotify={onNotify as unknown as (message: string) => void}
+      onApplyTaskRelationship={vi.fn(async () => undefined)}
       tagOps={{
         createTag: vi.fn(),
         renameTag: vi.fn(),
@@ -81,6 +86,30 @@ function renderPanel(overrides: {
 }
 
 describe('TasksPanel create feedback (v1.1.2 stage A)', () => {
+  // 任务 2.1（红灯①转绿）：换算提示由已保存设置派生——设置 1 分钟时提示 1 分钟。
+  it('shows the conversion hint derived from the saved focus duration', async () => {
+    renderPanel({ focusDurationMinutes: 1 })
+    const hint = await screen.findByText(
+      (_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('个番茄 =') ?? false),
+    )
+    expect(hint.textContent).toBe('个番茄 = 1 分钟')
+  })
+
+  it('submits a title-only task without implicit tag or priority', async () => {
+    const user = userEvent.setup()
+    const { onCreateTask } = renderPanel()
+    const input = screen.getByPlaceholderText('添加任务…')
+
+    await user.type(input, '只写标题')
+    await user.click(screen.getByRole('button', { name: '添加任务' }))
+
+    await waitFor(() => expect(onCreateTask).toHaveBeenCalledTimes(1))
+    const payload = onCreateTask.mock.calls[0][0] as Record<string, unknown>
+    expect(payload.projectId).toBeUndefined()
+    expect(payload.tagId).toBeUndefined()
+    expect(payload.priority).toBeUndefined()
+  })
+
   it('clears the title only after the create succeeds', async () => {
     const user = userEvent.setup()
     let resolveCreate: (value: unknown) => void = () => undefined

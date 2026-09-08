@@ -349,12 +349,12 @@ pub struct TimerSession {
     pub task_id: Option<String>,
     pub task_title_snapshot: String,
     pub project_snapshot: String,
-    /// Owning tag at session time (stable id). `None` only for v1 backups —
-    /// the importer maps it to the fallback tag.
+    /// Owning tag at session time (stable id). `None` is also valid for v5
+    /// tagless tasks; only v1 backups need legacy fallback reconstruction.
     #[serde(default)]
     pub tag_id: Option<String>,
     /// Tag NAME frozen at session time — historical label, never re-tagged.
-    /// `None` only for v1 backups (imported as the current fallback name).
+    /// `None` means either a genuine tagless v5 round or a legacy v1 payload.
     #[serde(default)]
     pub tag_name_snapshot: Option<String>,
     pub mode: TimerMode,
@@ -486,6 +486,14 @@ pub struct RelationshipPatch {
     pub project: NullablePatch<String>,
     #[serde(default = "NullablePatch::keep")]
     pub tag: NullablePatch<String>,
+    /// v1.4 阶段 C：优先级的显式清空通道（方案类型按同语义扩展——
+    /// deadline/notes 也必须通过同一原子补丁清空，避免普通编辑绕过修订号。
+    #[serde(default = "NullablePatch::keep")]
+    pub priority: NullablePatch<TaskPriority>,
+    #[serde(default = "NullablePatch::keep")]
+    pub deadline: NullablePatch<String>,
+    #[serde(default = "NullablePatch::keep")]
+    pub notes: NullablePatch<String>,
 }
 
 fn default_task_project() -> String {
@@ -603,6 +611,9 @@ pub struct UpdateProjectInput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationPreview {
+    /// `legacySemantic` for v1-v3 (user decisions required),
+    /// `nullableMetadata` for v4 (structural, existing values unchanged).
+    pub migration_kind: String,
     pub schema_version: u32,
     pub task_count: i64,
     pub session_count: i64,
@@ -816,6 +827,67 @@ pub struct ExportBundle {
     pub tags: Vec<Tag>,
     pub tasks: Vec<Task>,
     pub sessions: Vec<TimerSession>,
+    /// v1.4 (backup format v3): complete category/project snapshots. Older
+    /// v2/v3 files omit these fields and are imported through the compatibility
+    /// path that keeps the live defaults and synthesizes only referenced rows.
+    #[serde(default)]
+    pub categories: Vec<BackupCategory>,
+    #[serde(default)]
+    pub projects: Vec<BackupProject>,
+}
+
+/// Category snapshot included in a v3 backup. All fields are copied verbatim
+/// so sorting, archive state and rename history do not disappear on restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupCategory {
+    pub id: String,
+    #[serde(default = "default_local_profile")]
+    pub profile_id: String,
+    pub name: String,
+    #[serde(default = "default_active_status")]
+    pub status: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// Complete project snapshot for backups. New fields have serde defaults so
+/// the original minimal v3 project entries remain importable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupProject {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_active_status")]
+    pub status: String,
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub category_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub plan_start_date: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_local_profile() -> String {
+    "local".to_owned()
+}
+
+fn default_active_status() -> String {
+    "active".to_owned()
 }
 
 /// Row counts shown to the user before a destructive import is confirmed.

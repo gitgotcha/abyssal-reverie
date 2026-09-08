@@ -1,51 +1,187 @@
-import { useState } from "react";
-import type { Category, Project, Task, TaskPriority, TaskProgress, UpdateTaskInput } from "../../domain/models";
+import { useEffect, useState } from "react";
+import type {
+  Category, NullablePatch, Project, RelationshipPatch, Tag, Task, TaskPriority,
+  TaskProgress, UpdateTaskInput,
+} from "../../domain/models";
 import { C, CARD } from "../shared/palette";
 import { PRIORITY_LABELS, formatProgressLine } from "./TasksPanel";
+import { DatePicker } from "../../components/DatePicker";
+import { SearchablePicker } from "../shared/SearchablePicker";
+
+type TaskDraft = {
+  title: string;
+  projectId: string;
+  tagId: string;
+  pomodoro: number;
+  budgetMinutes: string;
+  priority: TaskPriority | "";
+  deadline: string;
+  notes: string;
+};
+
+const draftKey = (taskId: string) => `abyssal-reverie.task-draft.${taskId}`;
+
+function draftStorage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const storage = window.localStorage;
+    storage.getItem("__abyssal_reverie_storage_probe__");
+    return storage;
+  } catch {
+    try {
+      const storage = window.sessionStorage;
+      storage.getItem("__abyssal_reverie_storage_probe__");
+      return storage;
+    } catch { return null; }
+  }
+}
+
+function loadTaskDraft(taskId: string): TaskDraft | null {
+  try {
+    const raw = draftStorage()?.getItem(draftKey(taskId));
+    if (!raw) return null;
+    const draft = JSON.parse(raw) as Partial<TaskDraft>;
+    if (typeof draft.title !== "string" || typeof draft.pomodoro !== "number") return null;
+    return {
+      title: draft.title,
+      projectId: typeof draft.projectId === "string" ? draft.projectId : "",
+      tagId: typeof draft.tagId === "string" ? draft.tagId : "",
+      pomodoro: Math.max(1, Math.min(99, draft.pomodoro)),
+      budgetMinutes: typeof draft.budgetMinutes === "string" ? draft.budgetMinutes : "1",
+      priority: draft.priority === "high" || draft.priority === "med" || draft.priority === "low" ? draft.priority : "",
+      deadline: typeof draft.deadline === "string" ? draft.deadline : "",
+      notes: typeof draft.notes === "string" ? draft.notes : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearTaskDraft(taskId: string): void {
+  try { draftStorage()?.removeItem(draftKey(taskId)); } catch { /* storage may be disabled */ }
+}
 
 /** v1.2 F2: task detail — edit metadata, save with visible state, complete or
  *  archive. Failure keeps the dialog open with the error inline. */
-export function TaskDetailDialog({ task, progress, categories, projects, onClose, onSave, onToggleDone, onArchive, onComplete }: {
+export function TaskDetailDialog({ task, progress, categories, projects, tags, onClose, onSave, onApplyRelationship, onToggleDone, onArchive, onComplete }: {
   task: Task;
   progress?: TaskProgress;
   categories: Category[];
   projects: Project[];
+  tags: Tag[];
   onClose: () => void;
   onSave: (patch: Omit<UpdateTaskInput, "id">) => Promise<unknown>;
+  onApplyRelationship: (patch: RelationshipPatch) => Promise<unknown>;
   onToggleDone: () => void;
   onArchive: () => void;
   onComplete: () => Promise<unknown>;
 }) {
-  const [title, setTitle] = useState(task.title);
-  const [projectId, setProjectId] = useState(task.projectId ?? "");
-  const [pomodoro, setPomodoro] = useState(task.pomodoroTarget);
-  const [priority, setPriority] = useState<TaskPriority>(task.priority);
-  const [deadline, setDeadline] = useState(task.deadline ?? "");
-  const [notes, setNotes] = useState(task.notes);
+  const [restoredDraft] = useState(() => loadTaskDraft(task.id));
+  const [title, setTitle] = useState(restoredDraft?.title ?? task.title);
+  const [projectId, setProjectId] = useState(restoredDraft?.projectId ?? task.projectId ?? "");
+  const [tagId, setTagId] = useState(restoredDraft?.tagId ?? task.tagId ?? "");
+  const [pomodoro, setPomodoro] = useState(restoredDraft?.pomodoro ?? task.pomodoroTarget);
+  const [budgetMinutes, setBudgetMinutes] = useState(
+    restoredDraft?.budgetMinutes ?? String(Math.max(1, Math.round(task.targetSeconds / 60))),
+  );
+  const budgetSeconds = Math.max(1, Number(budgetMinutes) || 1) * 60;
+  const [priority, setPriority] = useState<TaskPriority | "">(restoredDraft?.priority ?? task.priority ?? "");
+  const [deadline, setDeadline] = useState(restoredDraft?.deadline ?? task.deadline ?? "");
+  const [notes, setNotes] = useState(restoredDraft?.notes ?? task.notes);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [saveState, setSaveState] = useState<"clean" | "dirty" | "saving" | "saved" | "error">("clean");
 
   const dirty =
     title !== task.title || projectId !== (task.projectId ?? "") ||
-    pomodoro !== task.pomodoroTarget || priority !== task.priority ||
+    pomodoro !== task.pomodoroTarget ||
+    budgetSeconds !== task.targetSeconds || priority !== (task.priority ?? "") ||
+    tagId !== (task.tagId ?? "") ||
     deadline !== (task.deadline ?? "") || notes !== task.notes;
+
+  useEffect(() => {
+    if (!dirty) {
+      clearTaskDraft(task.id);
+      return;
+    }
+    try {
+      const draft: TaskDraft = { title, projectId, tagId, pomodoro, budgetMinutes, priority, deadline, notes };
+      draftStorage()?.setItem(draftKey(task.id), JSON.stringify(draft));
+    } catch { /* storage may be disabled */ }
+  }, [task.id, dirty, title, projectId, tagId, pomodoro, budgetMinutes, priority, deadline, notes]);
+
+  const requestClose = () => {
+    if (saving) return;
+    if (dirty && !window.confirm("还有未保存的修改，确定要放弃吗？")) return;
+    clearTaskDraft(task.id);
+    onClose();
+  };
+
+  const projectOptions = categories.filter(category => category.status === "active").flatMap(category =>
+    projects.filter(project => project.categoryId === category.id && (project.status !== "archived" || project.id === task.projectId))
+      .map(project => ({ value: project.id, label: project.status === "archived" ? `已归档 · ${project.name}` : project.name, group: category.name, disabled: project.status === "archived" })),
+  );
+  const tagOptions = tags.map(tag => ({ value: tag.id, label: tag.name }));
 
   const save = async () => {
     if (saving) return;
     setSaving(true);
+    setSaveState("saving");
     setError(null);
     try {
-      await onSave({
-        title,
-        projectId,
-        pomodoroTarget: pomodoro,
-        priority,
-        deadline,
-        notes,
-      });
+      const relationshipChanged =
+        projectId !== (task.projectId ?? "") ||
+        tagId !== (task.tagId ?? "") ||
+        priority !== (task.priority ?? "") ||
+        deadline !== (task.deadline ?? "") ||
+        notes !== task.notes;
+
+      if (relationshipChanged) {
+        const project: NullablePatch<string> = projectId === (task.projectId ?? "")
+          ? { action: "keep" }
+          : projectId ? { action: "set", value: projectId } : { action: "clear" };
+        const tag: NullablePatch<string> = tagId === (task.tagId ?? "")
+          ? { action: "keep" }
+          : tagId ? { action: "set", value: tagId } : { action: "clear" };
+        const nextPriority: NullablePatch<TaskPriority> = priority === (task.priority ?? "")
+          ? { action: "keep" }
+          : priority ? { action: "set", value: priority } : { action: "clear" };
+        const nextDeadline: NullablePatch<string> = deadline === (task.deadline ?? "")
+          ? { action: "keep" }
+          : deadline ? { action: "set", value: deadline } : { action: "clear" };
+        const nextNotes: NullablePatch<string> = notes === task.notes
+          ? { action: "keep" }
+          : notes ? { action: "set", value: notes } : { action: "clear" };
+        await onApplyRelationship({
+          taskId: task.id,
+          expectedRevision: task.relationshipRevision,
+          project,
+          tag,
+          priority: nextPriority,
+          deadline: nextDeadline,
+          notes: nextNotes,
+        });
+      }
+
+      if (
+        title !== task.title ||
+        pomodoro !== task.pomodoroTarget ||
+        budgetSeconds !== task.targetSeconds
+      ) {
+        await onSave({
+          title,
+          pomodoroTarget: pomodoro,
+          ...(budgetSeconds !== task.targetSeconds
+            ? { targetSeconds: budgetSeconds }
+            : {}),
+        });
+      }
+      clearTaskDraft(task.id);
+      setSaveState("saved");
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setSaveState("error");
     } finally {
       setSaving(false);
     }
@@ -58,12 +194,12 @@ export function TaskDetailDialog({ task, progress, categories, projects, onClose
   } as const;
 
   return (
-    <div role="dialog" aria-modal="true" aria-label="任务详情" onClick={onClose}
+    <div role="dialog" aria-modal="true" aria-label="任务详情" onClick={requestClose}
       style={{
         position: "fixed", inset: 0, zIndex: 85, background: "rgba(2,3,5,0.45)",
         display: "flex", alignItems: "center", justifyContent: "center",
       }}>
-      <div role="document" onClick={e => e.stopPropagation()}
+        <div role="document" onClick={e => e.stopPropagation()}
         style={{
           width: "min(420px, 92vw)", maxHeight: "88vh", overflowY: "auto",
           padding: "18px 20px", borderRadius: 14,
@@ -73,7 +209,14 @@ export function TaskDetailDialog({ task, progress, categories, projects, onClose
           boxShadow: "0 18px 48px rgba(2,3,5,0.5)",
           display: "flex", flexDirection: "column", gap: 12,
         }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: C.textPrimary, fontFamily: "var(--font-sans)" }}>任务详情</div>
+        <div style={{ display: "flex", alignItems: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 500, color: C.textPrimary, fontFamily: "var(--font-sans)" }}>任务详情</div>
+          <span style={{ marginLeft: 8, fontSize: 10, color: saveState === "error" ? "rgba(231,164,145,0.95)" : saveState === "saved" ? C.silver : C.textMuted, fontFamily: "var(--font-sans)" }}>
+            {saveState === "saving" ? "保存中…" : saveState === "saved" ? "已保存" : saveState === "error" ? "保存失败，可重试" : restoredDraft ? "已恢复未保存草稿" : dirty ? "未保存" : ""}
+          </span>
+          <button type="button" onClick={requestClose} aria-label="关闭任务详情" className="btn-delete"
+            style={{ marginLeft: "auto", width: 24, height: 24, borderRadius: 6, background: "transparent", border: "1px solid transparent", color: C.textMuted, cursor: "pointer" }}>×</button>
+        </div>
 
         {progress && task.targetSeconds > 0 && (
           <div style={{ padding: "8px 10px", ...CARD, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)" }}>
@@ -93,22 +236,19 @@ export function TaskDetailDialog({ task, progress, categories, projects, onClose
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)", flex: 1, minWidth: 120 }}>
             项目
-            <select value={projectId} onChange={e => setProjectId(e.target.value)} aria-label="所属项目"
-              style={{ ...field, cursor: "pointer" }}>
-              <option value="">独立任务</option>
-              {categories.filter(c => c.status === "active").map(cat => (
-                <optgroup key={cat.id} label={cat.name}>
-                  {projects.filter(p => p.categoryId === cat.id && p.status !== "archived").map(p => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
+            <SearchablePicker value={projectId} onChange={setProjectId} options={projectOptions}
+              ariaLabel="所属项目" emptyLabel="独立任务" placeholder="搜索项目…" />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)", flex: 1, minWidth: 100 }}>
+            标签
+            <SearchablePicker value={tagId} onChange={setTagId} options={tagOptions}
+              ariaLabel="任务标签" emptyLabel="未设置" placeholder="搜索标签…" />
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)", flex: 1, minWidth: 90 }}>
             优先级
             <select value={priority} onChange={e => setPriority(e.target.value as TaskPriority)} aria-label="优先级"
               style={{ ...field, cursor: "pointer" }}>
+              <option value="">未设置</option>
               <option value="high">高</option>
               <option value="med">中</option>
               <option value="low">低</option>
@@ -120,10 +260,15 @@ export function TaskDetailDialog({ task, progress, categories, projects, onClose
               onChange={e => setPomodoro(Number(e.target.value) || 1)}
               aria-label="预计番茄数" style={{ ...field, fontFamily: "var(--font-mono)" }} />
           </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)", width: 88 }}>
+            预算分钟
+            <input type="number" min={1} max={24 * 60} value={budgetMinutes}
+              onChange={e => setBudgetMinutes(e.target.value)}
+              aria-label="预算分钟" style={{ ...field, fontFamily: "var(--font-mono)" }} />
+          </label>
           <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)", width: 140 }}>
             截止日期
-            <input type="date" value={deadline} onChange={e => setDeadline(e.target.value)}
-              aria-label="截止日期" style={{ ...field }} />
+            <DatePicker value={deadline} onChange={setDeadline} />
           </label>
         </div>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: C.textMuted, fontFamily: "var(--font-sans)" }}>

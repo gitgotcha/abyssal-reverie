@@ -46,7 +46,9 @@ pub const MAX_DAILY_GOAL: i64 = 50;
 
 /// Backup bundle identity + version (Item 3: data export & backup).
 pub const EXPORT_APP_NAME: &str = "abyssal-reverie";
-pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+/// v3 (task 1.7): carries `projects` so task.project_id links survive the
+/// round trip. v2 backups (no projects field) still parse and import.
+pub const EXPORT_SCHEMA_VERSION: u32 = 3;
 
 const TASK_COLUMNS: &str = "id, title, done, pomodoro_target, priority, project, project_id, \
                             target_seconds, budget_source, status, deadline, notes, tag_id, \
@@ -526,27 +528,52 @@ pub fn apply_relationship_patch(
             Some(value.clone())
         }
     };
+    let new_priority = match &patch.priority {
+        crate::models::NullablePatch::Keep => current.priority.clone(),
+        crate::models::NullablePatch::Clear => None,
+        crate::models::NullablePatch::Set { value } => Some(value.clone()),
+    };
+    let new_deadline = match &patch.deadline {
+        crate::models::NullablePatch::Keep => current.deadline.clone(),
+        crate::models::NullablePatch::Clear => None,
+        crate::models::NullablePatch::Set { value } => Some(value.clone()),
+    };
+    let new_notes = match &patch.notes {
+        crate::models::NullablePatch::Keep => current.notes.clone(),
+        crate::models::NullablePatch::Clear => String::new(),
+        crate::models::NullablePatch::Set { value } => value.clone(),
+    };
 
     // Bump ONLY when a stored value actually changes: Keep+Keep, clearing an
     // already-NULL field and re-setting the currently-held id are all no-ops.
-    let changed = new_project_id != current.project_id || new_tag_id != current.tag_id;
+    let changed = new_project_id != current.project_id
+        || new_tag_id != current.tag_id
+        || new_priority != current.priority
+        || new_deadline != current.deadline
+        || new_notes != current.notes;
 
     let mut task = current;
     if changed {
         task.project_id = new_project_id;
         task.project = new_project_name;
         task.tag_id = new_tag_id;
+        task.priority = new_priority;
+        task.deadline = new_deadline;
+        task.notes = new_notes;
         task.relationship_revision += 1;
         task.updated_at = now_millis();
 
         tx.execute(
-            "UPDATE tasks SET project = ?1, project_id = ?2, tag_id = ?3,
-                              relationship_revision = ?4, updated_at = ?5
-             WHERE id = ?6",
+            "UPDATE tasks SET project = ?1, project_id = ?2, tag_id = ?3, priority = ?4,
+                              deadline = ?5, notes = ?6, relationship_revision = ?7, updated_at = ?8
+             WHERE id = ?9",
             params![
                 task.project,
                 task.project_id,
                 task.tag_id,
+                task.priority.as_ref().map(|p| p.as_str()),
+                task.deadline,
+                task.notes,
                 task.relationship_revision,
                 task.updated_at,
                 task.id,
@@ -749,10 +776,11 @@ pub fn preview_delete_tag(conn: &Connection, id: &str) -> Result<TagDeletePrevie
 }
 
 /// Two-phase delete per spec §9.3: the UI confirms with the affected count,
-/// then this runs everything in ONE transaction — reassign the tag's tasks to
-/// the fallback tag, let the FKs null out timer/session references (snapshots
-/// are preserved), and delete the tag. The affected count is recomputed here;
-/// the preview value is never trusted.
+/// then this runs everything in ONE transaction — clear the tag's task
+/// associations (never choose a replacement tag on the user's behalf), let
+/// the FKs null out timer/session references (snapshots are preserved), and
+/// delete the tag. The affected count is recomputed here; the preview value is
+/// never trusted.
 pub fn delete_tag(conn: &mut Connection, id: &str) -> Result<DeleteTagResult, CommandError> {
     let tx = conn.transaction()?;
 
@@ -769,10 +797,10 @@ pub fn delete_tag(conn: &mut Connection, id: &str) -> Result<DeleteTagResult, Co
         return Err(CommandError::conflict("保底标签不能删除"));
     }
 
-    let (fallback_id, _fallback_name) = fallback_tag(&tx)?;
-    let reassigned = tx.execute(
-        "UPDATE tasks SET tag_id = ?1, updated_at = ?2 WHERE tag_id = ?3",
-        params![fallback_id, now_millis(), id],
+    let fallback_id = fallback_tag(&tx)?.0;
+    tx.execute(
+        "UPDATE tasks SET tag_id = NULL, updated_at = ?1 WHERE tag_id = ?2",
+        params![now_millis(), id],
     )?;
 
     // tasks.tag_id is RESTRICT, so the tag can only be deleted after the
@@ -797,7 +825,9 @@ pub fn delete_tag(conn: &mut Connection, id: &str) -> Result<DeleteTagResult, Co
     Ok(DeleteTagResult {
         deleted_tag_id: id.to_owned(),
         fallback_tag_id: fallback_id,
-        reassigned_tasks: reassigned as i64,
+        // Kept for wire compatibility with v1.1 clients; the operation now
+        // clears associations, so no task is reassigned to the fallback tag.
+        reassigned_tasks: 0,
         tags: list_tags(conn)?,
         tasks: list_tasks(conn)?,
     })
@@ -2914,18 +2944,53 @@ pub fn all_time_statistics(conn: &Connection) -> Result<Statistics, CommandError
 
 // ─── Data export & backup (Item 3) ──────────────────────────────────────────
 
-/// Builds a lossless JSON backup bundle: settings, all tasks, all sessions.
+/// Builds a lossless JSON backup bundle: settings, all tasks, all sessions,
+/// and the complete category/project hierarchy.
 pub fn export_data(conn: &Connection) -> Result<ExportBundle, CommandError> {
     // Backups are complete by definition: they use scope=all so hidden
     // records (too_short / abandoned / breaks) survive the round trip.
+    let tasks = list_tasks(conn)?;
+    // Backup format v3: carry complete category/project snapshots, not just
+    // the display name of projects referenced by tasks. This keeps archived
+    // projects, dates, descriptions and ordering intact after restore.
+    let categories = list_categories(conn)?
+        .into_iter()
+        .map(|category| crate::models::BackupCategory {
+            id: category.id,
+            profile_id: category.profile_id,
+            name: category.name,
+            status: category.status,
+            sort_order: category.sort_order,
+            created_at: category.created_at,
+            updated_at: category.updated_at,
+        })
+        .collect();
+    let projects = list_projects(conn)?
+        .into_iter()
+        .map(|project| crate::models::BackupProject {
+            id: project.id,
+            name: project.name,
+            status: project.status,
+            profile_id: project.profile_id,
+            category_id: project.category_id,
+            description: project.description,
+            plan_start_date: project.plan_start_date,
+            due_date: project.due_date,
+            sort_order: project.sort_order,
+            created_at: project.created_at,
+            updated_at: project.updated_at,
+        })
+        .collect();
     Ok(ExportBundle {
         app: EXPORT_APP_NAME.to_owned(),
         schema_version: EXPORT_SCHEMA_VERSION,
         exported_at: now_millis(),
         settings: get_settings(conn)?,
         tags: list_tags(conn)?,
-        tasks: list_tasks(conn)?,
+        tasks,
         sessions: list_all_sessions(conn)?,
+        categories,
+        projects,
     })
 }
 
@@ -3013,6 +3078,8 @@ fn normalize_v1_bundle(v1: ExportBundleV1) -> ExportBundle {
         tags,
         tasks,
         sessions,
+        categories: Vec::new(),
+        projects: Vec::new(),
     }
 }
 
@@ -3033,8 +3100,10 @@ pub fn parse_backup_text(text: &str) -> Result<ExportBundle, CommandError> {
                 .map_err(|err| CommandError::validation(format!("v1 备份解析失败: {err}")))?;
             Ok(normalize_v1_bundle(v1))
         }
-        2 => serde_json::from_str::<ExportBundle>(text)
-            .map_err(|err| CommandError::validation(format!("v2 备份解析失败: {err}"))),
+        // v2 and v3 share the ExportBundle shape — v3 additionally carries
+        // the `projects` snapshots (absent on v2, serde default = empty).
+        2 | 3 => serde_json::from_str::<ExportBundle>(text)
+            .map_err(|err| CommandError::validation(format!("备份解析失败: {err}"))),
         other => Err(CommandError::validation(format!(
             "备份版本 {other} 不受支持（当前最高 {EXPORT_SCHEMA_VERSION}）"
         ))),
@@ -3093,6 +3162,48 @@ pub fn validate_import(bundle: &ExportBundle) -> Result<(), CommandError> {
             }
         }
     }
+    // v3 backups carry project snapshots; every non-NULL task.project_id
+    // must resolve inside the bundle. v2 had no project snapshot section, so
+    // import_data synthesizes a minimal active row from the task's legacy
+    // display name instead of rejecting an otherwise valid old backup.
+    if bundle.schema_version >= 3 {
+        for task in &bundle.tasks {
+            let Some(project_id) = task.project_id.as_deref() else { continue };
+            if !bundle.projects.iter().any(|p| p.id == project_id) {
+                return Err(CommandError::validation(format!(
+                    "任务“{}”引用了备份中不存在的项目",
+                    task.title
+                )));
+            }
+        }
+        if !bundle.categories.is_empty() {
+            for category in &bundle.categories {
+                if category.profile_id != "local" {
+                    return Err(CommandError::validation(
+                        "备份包含不属于本地配置的类别",
+                    ));
+                }
+                if category.name.trim().is_empty() {
+                    return Err(CommandError::validation("备份包含空类别名称"));
+                }
+            }
+            for project in &bundle.projects {
+                if project.category_id.is_empty()
+                    || !bundle.categories.iter().any(|c| c.id == project.category_id)
+                {
+                    return Err(CommandError::validation(format!(
+                        "项目“{}”引用了备份中不存在的类别",
+                        project.name
+                    )));
+                }
+                if !project.profile_id.is_empty() && project.profile_id != "local" {
+                    return Err(CommandError::validation(
+                        "备份包含不属于本地配置的项目",
+                    ));
+                }
+            }
+        }
+    }
     validate_settings(&bundle.settings)?;
     for task in &bundle.tasks {
         validate_title(&task.title)?;
@@ -3137,15 +3248,108 @@ pub fn import_data(conn: &mut Connection, bundle: &ExportBundle) -> Result<Impor
         )?;
     }
 
+    // A current v3 backup carries complete category/project snapshots. Replace
+    // those live rows before tasks so every project_id FK resolves. Older v2
+    // and early v3 files omit categories and fall back to the existing default
+    // category while synthesizing only the rows referenced by tasks.
+    let has_category_snapshot = !bundle.categories.is_empty();
+    if has_category_snapshot {
+        tx.execute("DELETE FROM projects", [])?;
+        tx.execute("DELETE FROM categories", [])?;
+        for category in &bundle.categories {
+            tx.execute(
+                "INSERT INTO categories (id, profile_id, name, normalized_name, status,
+                                         sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    category.id,
+                    category.profile_id,
+                    category.name,
+                    category.name.to_lowercase(),
+                    category.status,
+                    category.sort_order,
+                    category.created_at,
+                    category.updated_at,
+                ],
+            )?;
+        }
+    }
+
+    // Re-create missing project rows BEFORE tasks (project_id FK). v2 and
+    // early v3 backups did not carry category snapshots, so synthesize the
+    // minimal rows needed by legacy task references from their display names.
+    let mut projects_to_create = bundle.projects.clone();
+    if !has_category_snapshot {
+        for task in &bundle.tasks {
+            let Some(project_id) = task.project_id.as_deref() else { continue };
+            if !projects_to_create.iter().any(|p| p.id == project_id) {
+                projects_to_create.push(crate::models::BackupProject {
+                    id: project_id.to_owned(),
+                    name: task.project.clone(),
+                    status: "active".to_owned(),
+                    profile_id: "local".to_owned(),
+                    category_id: String::new(),
+                    description: String::new(),
+                    plan_start_date: None,
+                    due_date: None,
+                    sort_order: 0,
+                    created_at: now,
+                    updated_at: now,
+                });
+            }
+        }
+    }
+    let fallback_category_id: String = tx.query_row(
+        "SELECT id FROM categories WHERE profile_id = 'local' AND name = '其他'",
+        [],
+        |row| row.get(0),
+    )?;
+    for project in &projects_to_create {
+        let category_id = if project.category_id.is_empty() {
+            fallback_category_id.as_str()
+        } else {
+            project.category_id.as_str()
+        };
+        let profile_id = if project.profile_id.is_empty() {
+            "local"
+        } else {
+            project.profile_id.as_str()
+        };
+        tx.execute(
+            "INSERT INTO projects (id, profile_id, category_id, name, normalized_name,
+                                   description, status, plan_start_date, due_date,
+                                   sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                project.id,
+                profile_id,
+                category_id,
+                project.name,
+                project.name.to_lowercase(),
+                project.description,
+                project.status,
+                project.plan_start_date,
+                project.due_date,
+                project.sort_order,
+                if project.created_at == 0 { now } else { project.created_at },
+                if project.updated_at == 0 { now } else { project.updated_at },
+            ],
+        )?;
+    }
+
     // Replace tasks (ids preserved from the backup; tag_id defaults to the
     // fallback tag for v1 backups via the model's serde default). v5 keeps
-    // NULL metadata and the relationship revision verbatim (round-trip fidelity).
+    // NULL metadata, budgets, status, deadlines, notes, project links and the
+    // relationship revision verbatim (round-trip fidelity, task 1.7).
     for task in &bundle.tasks {
         tx.execute(
+            // profile_id is NOT in the Task read model: the column's
+            // DEFAULT 'local' applies (single profile until v1.4).
             "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
                                 sort_order, created_at, updated_at, completed_at,
-                                relationship_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                project_id, target_seconds, budget_source, status, deadline,
+                                notes, relationship_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 task.id,
                 task.title,
@@ -3158,6 +3362,12 @@ pub fn import_data(conn: &mut Connection, bundle: &ExportBundle) -> Result<Impor
                 task.created_at,
                 task.updated_at,
                 task.completed_at,
+                task.project_id,
+                task.target_seconds,
+                task.budget_source,
+                task.status,
+                task.deadline,
+                task.notes,
                 task.relationship_revision,
             ],
         )?;
@@ -3168,7 +3378,18 @@ pub fn import_data(conn: &mut Connection, bundle: &ExportBundle) -> Result<Impor
     tx.execute("DELETE FROM sessions", [])?;
     for session in &bundle.sessions {
         let (finish, eligible, qualification) = effective_qualification(session);
-        let (fallback_id, fallback_name) = fallback_tag(&tx)?;
+        let (_fallback_id, fallback_name) = fallback_tag(&tx)?;
+        // A v5 tagless session is a real historical state, not a legacy
+        // missing-field case. Preserve its NULL id and use the explicit
+        // no-tag label when an older payload omitted the snapshot name.
+        let imported_tag_name = match (&session.tag_id, &session.tag_name_snapshot) {
+            (_, Some(name)) => name.clone(),
+            (Some(_), None) => fallback_name.clone(),
+            // v1/v2 payloads had no way to represent a deliberate tagless
+            // round; their missing fields mean the historical fallback tag.
+            (None, None) if bundle.schema_version < 3 => fallback_name.clone(),
+            (None, None) => NO_TAG_SNAPSHOT.to_owned(),
+        };
         tx.execute(
             "INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
                                    tag_name_snapshot, mode, status, planned_seconds,
@@ -3180,11 +3401,8 @@ pub fn import_data(conn: &mut Connection, bundle: &ExportBundle) -> Result<Impor
                 session.task_id,
                 session.task_title_snapshot,
                 session.project_snapshot,
-                session.tag_id.clone().unwrap_or_else(|| fallback_id.clone()),
-                session
-                    .tag_name_snapshot
-                    .clone()
-                    .unwrap_or_else(|| fallback_name.clone()),
+                session.tag_id,
+                imported_tag_name,
                 session.mode.as_str(),
                 session.status.as_str(),
                 session.planned_seconds,
@@ -3294,7 +3512,7 @@ pub fn export_sessions_csv(conn: &Connection) -> Result<String, CommandError> {
 mod tests {
     use super::*;
     use crate::db;
-    use crate::models::{NullablePatch, RelationshipPatch, StatisticsDayBoundary};
+    use crate::models::{NullablePatch, RelationshipPatch, StatisticsDayBoundary, TimerRevisionInput};
 
     fn create_input(title: &str) -> CreateTaskInput {
         CreateTaskInput {
@@ -4076,6 +4294,39 @@ mod tests {
     }
 
     #[test]
+    fn changing_default_focus_duration_does_not_rewrite_old_budget_or_active_round() {
+        let mut conn = db::open_in_memory().expect("db");
+        let settings = get_settings(&conn).expect("settings");
+        let task = insert_task(&conn, &CreateTaskInput {
+            title: "旧预算".to_owned(),
+            pomodoro_target: 2,
+            priority: None,
+            tag_id: None,
+            ..Default::default()
+        }).expect("task");
+        let running = start_timer(&mut conn, &settings, &StartTimerInput {
+            expected_revision: 0,
+            mode: TimerMode::Focus,
+            selected_task_id: Some(task.id.clone()),
+        }).expect("start");
+
+        let mut changed = settings.clone();
+        changed.focus_duration_minutes = 40;
+        let saved = save_settings(&conn, &changed).expect("save settings");
+
+        assert_eq!(get_task(&conn, &task.id).expect("task").target_seconds, 2 * 25 * 60);
+        assert_eq!(saved.timer.duration_seconds, running.duration_seconds);
+        assert_eq!(saved.timer.remaining_seconds, running.remaining_seconds);
+
+        let paused = pause_timer(&mut conn, &TimerRevisionInput { expected_revision: running.revision })
+            .expect("pause");
+        changed.focus_duration_minutes = 60;
+        let saved_paused = save_settings(&conn, &changed).expect("save paused settings");
+        assert_eq!(saved_paused.timer.duration_seconds, paused.duration_seconds);
+        assert_eq!(saved_paused.timer.remaining_seconds, paused.remaining_seconds);
+    }
+
+    #[test]
     fn save_settings_rejects_out_of_range_durations_and_goals() {
         let conn = db::open_in_memory().expect("database should open");
 
@@ -4254,7 +4505,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_tag_reassigns_tasks_and_preserves_snapshots() {
+    fn delete_tag_clears_tasks_and_preserves_snapshots() {
         let mut conn = db::open_in_memory().expect("db");
         let tag = create_tag(&conn, &CreateTagInput { name: "将被删除".to_owned() }).expect("create");
 
@@ -4283,12 +4534,13 @@ mod tests {
 
         let result = delete_tag(&mut conn, &tag.id).expect("delete");
 
-        assert_eq!(result.reassigned_tasks, 1);
+        assert_eq!(result.reassigned_tasks, 0);
         assert_eq!(result.deleted_tag_id, tag.id);
 
-        // Task moved to the fallback tag.
+        // Deleting a tag clears the task association; it must not silently
+        // select a different tag on the user's behalf.
         let tasks = list_tasks(&conn).expect("tasks");
-        assert_eq!(tasks[0].tag_id.as_deref(), Some(result.fallback_tag_id.as_str()));
+        assert_eq!(tasks[0].tag_id, None);
 
         // Historical session keeps its frozen snapshot; the stable id is nulled.
         let snapshot: Option<String> = conn
@@ -4416,6 +4668,9 @@ mod tests {
                 expected_revision: task.relationship_revision,
                 project: NullablePatch::Clear,
                 tag: NullablePatch::Clear,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
@@ -4443,6 +4698,9 @@ mod tests {
                 expected_revision: task.relationship_revision,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Set { value: "tag-does-not-exist".to_owned() },
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         );
         assert!(matches!(missing, Err(ref e) if e.code == crate::error::ErrorCode::NotFound));
@@ -4455,6 +4713,9 @@ mod tests {
                 expected_revision: task.relationship_revision,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Set { value: work.id.clone() },
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
@@ -4477,6 +4738,9 @@ mod tests {
                 expected_revision: task.relationship_revision + 5,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Clear,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         );
         assert!(
@@ -4506,6 +4770,9 @@ mod tests {
                 expected_revision: task.relationship_revision + 1,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Keep,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         );
         assert!(
@@ -4554,6 +4821,9 @@ mod tests {
                 expected_revision: before.relationship_revision,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Keep,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
@@ -4580,6 +4850,9 @@ mod tests {
                 expected_revision: before.relationship_revision,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Clear,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
@@ -4606,6 +4879,9 @@ mod tests {
                 expected_revision: task.relationship_revision,
                 project: NullablePatch::Keep,
                 tag: NullablePatch::Set { value: "system-work".to_owned() },
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
@@ -4634,10 +4910,45 @@ mod tests {
                 expected_revision: task.relationship_revision,
                 project: NullablePatch::Set { value: task.project_id.clone().expect("abyssal project") },
                 tag: NullablePatch::Clear,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
             },
         )
         .expect("patch");
         assert_eq!(updated.tag_id, None);
+        assert_eq!(updated.relationship_revision, task.relationship_revision + 1);
+    }
+
+    #[test]
+    fn relationship_patch_can_clear_deadline_and_notes() {
+        let mut conn = db::open_in_memory().expect("db");
+        let task = insert_task(
+            &conn,
+            &CreateTaskInput {
+                deadline: Some("2026-12-31".to_owned()),
+                notes: Some("待清空".to_owned()),
+                ..create_input("清空元数据")
+            },
+        )
+        .expect("task");
+
+        let updated = apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: task.id.clone(),
+                expected_revision: task.relationship_revision,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Keep,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Clear,
+                notes: NullablePatch::Clear,
+            },
+        )
+        .expect("clear optional metadata");
+
+        assert_eq!(updated.deadline, None);
+        assert_eq!(updated.notes, "");
         assert_eq!(updated.relationship_revision, task.relationship_revision + 1);
     }
 
@@ -5872,11 +6183,11 @@ mod tests {
     // ─── Backup v2: version-header-first parsing (v1.1, review round 2) ───────
 
     #[test]
-    fn exports_v2_bundle_with_tags() {
+    fn exports_v3_bundle_with_tags() {
         let conn = db::open_in_memory().expect("db");
         let bundle = export_data(&conn).expect("export");
 
-        assert_eq!(bundle.schema_version, 2);
+        assert_eq!(bundle.schema_version, 3);
         assert_eq!(bundle.tags.len(), 4);
         assert_eq!(bundle.tags.iter().filter(|t| t.is_fallback).count(), 1);
     }
@@ -5909,7 +6220,7 @@ mod tests {
         }"#;
 
         let bundle = parse_backup_text(v1_json).expect("v1 backup parses");
-        assert_eq!(bundle.schema_version, 2, "normalized to the v2 shape");
+        assert_eq!(bundle.schema_version, 3, "normalized to the current shape");
         assert_eq!(bundle.tags.len(), 4);
         assert_eq!(bundle.tasks[0].tag_id.as_deref(), Some("system-other"));
         assert_eq!(bundle.sessions[0].finish_reason.as_deref(), Some("legacy"));
@@ -5966,7 +6277,7 @@ mod tests {
         let bundle = export_data(&conn).expect("export");
         let preview = preview_from_bundle(&bundle);
         assert_eq!(preview.tags, 4);
-        assert_eq!(preview.schema_version, 2);
+        assert_eq!(preview.schema_version, 3);
     }
 
 
@@ -6023,6 +6334,236 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].statistics_eligible, Some(true));
         assert_eq!(sessions[0].finish_reason.as_deref(), Some("elapsed"));
+    }
+
+    // ─── 阶段 B（任务 1.7）：备份与版本兼容测试组 ─────────────────────────────
+    // 结论固化（任务 1.7）：备份格式升为 v3——tasks 之外携带 `projects` 快照，
+    // 使 project_id 关联可往返；v2 备份（无 relationshipRevision / 无 projects）
+    // 仍按 0 读取并解析，v1 备份继续走 normalize 回填。数据库版本与备份版本各自管理。
+
+    #[test]
+    fn v5_backup_round_trip_preserves_null_metadata_and_revision() {
+        let mut conn = db::open_in_memory().expect("db");
+
+        // 标题-only：tag/priority 双 NULL + 一条全字段任务。
+        let title_only = insert_task(
+            &conn,
+            &CreateTaskInput { priority: None, ..create_input("只标题") },
+        )
+        .expect("task");
+        let full = insert_task(
+            &conn,
+            &CreateTaskInput {
+                tag_id: Some("system-work".to_owned()),
+                priority: Some(TaskPriority::High),
+                deadline: Some("2026-12-01".to_owned()),
+                notes: Some("备注要活着".to_owned()),
+                ..create_input("全字段")
+            },
+        )
+        .expect("task");
+        // 修订号推进到 2（两次真实关联变更）。
+        apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: full.id.clone(),
+                expected_revision: 0,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Clear,
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
+            },
+        )
+        .expect("clear tag");
+        apply_relationship_patch(
+            &mut conn,
+            &RelationshipPatch {
+                task_id: full.id.clone(),
+                expected_revision: 1,
+                project: NullablePatch::Keep,
+                tag: NullablePatch::Set { value: "system-life".to_owned() },
+                priority: NullablePatch::Keep,
+                deadline: NullablePatch::Keep,
+                notes: NullablePatch::Keep,
+            },
+        )
+        .expect("set tag");
+
+        let bundle = export_data(&conn).expect("export");
+        // 备份 JSON 层面：null 原样表达、修订号为数字（formatVersion=2 足够）。
+        let json = serde_json::to_value(&bundle).expect("serializable");
+        let tasks = json["tasks"].as_array().expect("tasks array");
+        let by_title = |t: &str| {
+            tasks.iter().find(|tj| tj["title"] == t).unwrap_or_else(|| panic!("missing {t}"))
+        };
+        assert_eq!(by_title("只标题")["tagId"], serde_json::Value::Null);
+        assert_eq!(by_title("只标题")["priority"], serde_json::Value::Null);
+        assert_eq!(by_title("全字段")["relationshipRevision"], serde_json::json!(2));
+        assert_eq!(by_title("全字段")["tagId"], serde_json::json!("system-life"));
+        assert_eq!(by_title("全字段")["deadline"], serde_json::json!("2026-12-01"));
+
+        // 清库重导：全部字段逐项保留。
+        delete_task(&conn, &title_only.id).expect("delete");
+        delete_task(&conn, &full.id).expect("delete");
+        import_data(&mut conn, &bundle).expect("import");
+
+        let restored = list_tasks(&conn).expect("list");
+        let by_id = |id: &str| restored.iter().find(|t| t.id == id).unwrap();
+        let restored_title = by_id(&title_only.id);
+        assert_eq!(restored_title.tag_id, None, "NULL tag must survive the round trip");
+        assert_eq!(restored_title.priority, None);
+        assert_eq!(restored_title.relationship_revision, 0);
+        let restored_full = by_id(&full.id);
+        assert_eq!(restored_full.tag_id.as_deref(), Some("system-life"));
+        assert_eq!(restored_full.priority, Some(TaskPriority::High));
+        assert_eq!(restored_full.relationship_revision, 2, "revision must survive");
+        assert_eq!(restored_full.deadline.as_deref(), Some("2026-12-01"));
+        assert_eq!(restored_full.notes, "备注要活着");
+        assert!(restored_full.project_id.is_some(), "project relationship must survive");
+    }
+
+    #[test]
+    fn v5_backup_round_trip_preserves_tagless_session_snapshot() {
+        let mut source = db::open_in_memory().expect("db");
+        let task = insert_task(&source, &create_input("无标签历史")).expect("task");
+        let mut timer = start_timer(
+            &mut source,
+            &settings(),
+            &StartTimerInput {
+                expected_revision: 0,
+                mode: TimerMode::Focus,
+                selected_task_id: Some(task.id.clone()),
+            },
+        )
+        .expect("start");
+        assert_eq!(timer.tag_id, None);
+        assert_eq!(timer.tag_name_snapshot.as_deref(), Some("无标签"));
+        timer.target_end_at = Some(now_millis() - 1);
+        write_timer(&source, &timer).expect("write expired timer");
+        complete_timer(
+            &mut source,
+            &settings(),
+            &CompleteTimerInput {
+                expected_revision: timer.revision,
+                active_session_id: timer.active_session_id.clone().unwrap(),
+                recovery: None,
+            },
+        )
+        .expect("complete");
+
+        let bundle = export_data(&source).expect("export");
+        assert_eq!(bundle.sessions[0].tag_id, None);
+        assert_eq!(bundle.sessions[0].tag_name_snapshot.as_deref(), Some("无标签"));
+
+        let mut target = db::open_in_memory().expect("db");
+        import_data(&mut target, &bundle).expect("import");
+        let restored = list_sessions_query(
+            &target,
+            &SessionQuery {
+                limit: None,
+                from: None,
+                to: None,
+                scope: Some(crate::models::SessionScope::All),
+            },
+        )
+        .expect("sessions");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].tag_id, None, "tagless session must remain unbound");
+        assert_eq!(restored[0].tag_name_snapshot.as_deref(), Some("无标签"));
+    }
+
+    #[test]
+    fn v3_backup_round_trip_preserves_category_and_project_metadata() {
+        let source = db::open_in_memory().expect("db");
+        let category = create_category(
+            &source,
+            &CreateCategoryInput { name: "产品研发".to_owned() },
+        )
+        .expect("category");
+        let project = create_project(
+            &source,
+            &CreateProjectInput {
+                name: "桌面端重构".to_owned(),
+                category_id: category.id.clone(),
+                description: Some("保留完整项目元数据".to_owned()),
+                plan_start_date: Some("2026-09-01".to_owned()),
+                due_date: Some("2026-10-01".to_owned()),
+            },
+        )
+        .expect("project");
+        insert_task(
+            &source,
+            &CreateTaskInput {
+                title: "项目任务".to_owned(),
+                project_id: Some(project.id.clone()),
+                pomodoro_target: 1,
+                ..Default::default()
+            },
+        )
+        .expect("task");
+
+        let bundle = export_data(&source).expect("export");
+        assert!(bundle.categories.iter().any(|c| c.id == category.id));
+        let exported_project = bundle.projects.iter().find(|p| p.id == project.id).expect("project snapshot");
+        assert_eq!(exported_project.category_id, category.id);
+        assert_eq!(exported_project.description, "保留完整项目元数据");
+        assert_eq!(exported_project.plan_start_date.as_deref(), Some("2026-09-01"));
+        assert_eq!(exported_project.due_date.as_deref(), Some("2026-10-01"));
+
+        let mut target = db::open_in_memory().expect("db");
+        import_data(&mut target, &bundle).expect("import");
+        let restored_category = list_categories(&target)
+            .expect("categories")
+            .into_iter()
+            .find(|c| c.id == category.id)
+            .expect("restored category");
+        assert_eq!(restored_category.name, "产品研发");
+        let restored_project = get_project(&target, &project.id).expect("restored project");
+        assert_eq!(restored_project.category_id, category.id);
+        assert_eq!(restored_project.description, "保留完整项目元数据");
+        assert_eq!(restored_project.plan_start_date.as_deref(), Some("2026-09-01"));
+        assert_eq!(restored_project.due_date.as_deref(), Some("2026-10-01"));
+    }
+
+    #[test]
+    fn v2_backup_without_relationship_revision_imports_as_zero() {
+        let mut conn = db::open_in_memory().expect("db");
+        // 旧 v2 备份（v1.2 时代）：无 relationshipRevision / 无 null 字段。
+        let v2_json = r#"{
+            "app": "abyssal-reverie",
+            "schemaVersion": 2,
+            "exportedAt": 1000,
+            "settings": { "focusDurationMinutes": 25, "shortBreakMinutes": 5,
+                          "longBreakMinutes": 15, "autoStartBreak": false,
+                          "soundEnabled": true, "notificationEnabled": true,
+                          "dailyGoal": 8, "reduceMotion": false,
+                          "updatedAt": 1 },
+            "tags": [
+                { "id": "system-study", "name": "学习", "kind": "system", "isFallback": false, "sortOrder": 0, "createdAt": 1, "updatedAt": 1 },
+                { "id": "system-other", "name": "其他", "kind": "system", "isFallback": true, "sortOrder": 3, "createdAt": 1, "updatedAt": 1 }
+            ],
+            "tasks": [
+                { "id": "t-old", "title": "旧备份任务", "done": false, "pomodoroTarget": 2,
+                  "priority": "high", "project": "旧项目", "projectId": "legacy-project", "tagId": "system-study",
+                  "sortOrder": 0, "createdAt": 1, "updatedAt": 1, "completedAt": null }
+            ],
+            "sessions": []
+        }"#;
+        let bundle = parse_backup_text(v2_json).expect("v2 backup parses");
+        assert_eq!(bundle.schema_version, 2);
+        assert_eq!(bundle.tasks[0].relationship_revision, 0, "absent revision reads as 0");
+        assert_eq!(bundle.tasks[0].tag_id.as_deref(), Some("system-study"));
+        assert_eq!(bundle.tasks[0].priority, Some(TaskPriority::High));
+
+        import_data(&mut conn, &bundle).expect("import");
+        let restored = get_task(&conn, "t-old").expect("task");
+        assert_eq!(restored.relationship_revision, 0);
+        assert_eq!(restored.tag_id.as_deref(), Some("system-study"));
+        assert_eq!(restored.priority, Some(TaskPriority::High));
+        assert_eq!(restored.project_id.as_deref(), Some("legacy-project"));
+        assert_eq!(restored.project, "旧项目");
+        assert!(get_project(&conn, "legacy-project").is_ok());
     }
 
     #[test]

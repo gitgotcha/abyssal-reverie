@@ -2,11 +2,13 @@ import { useState } from "react";
 import type { Tag, TagDeletePreview } from "../../domain/models";
 import { C, CARD } from "../shared/palette";
 import { HorizonDivider } from "../timer/GoalRing";
+import { searchEntities } from "../../domain/search";
 
 /** Frosted-glass tag manager (v1.1 §11.5): create, rename, reorder and
  *  safely delete tags. The fallback tag is renameable but never deletable. */
-export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder, onPreviewDelete, onDelete }: {
+export function TagManager({ open, embedded = false, tags, onClose, onCreate, onRename, onReorder, onPreviewDelete, onDelete }: {
   open: boolean;
+  embedded?: boolean;
   tags: Tag[];
   onClose: () => void;
   onCreate: (name: string) => Promise<unknown>;
@@ -22,11 +24,10 @@ export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder,
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [confirmText, setConfirmText] = useState("");
+  const [search, setSearch] = useState("");
 
   if (!open) return null;
 
-  const fallback = tags.find(t => t.isFallback);
-  const fallbackName = fallback?.name ?? "其他";
   const run = (id: string, fn: () => Promise<unknown>) =>
     fn().then(() => setRowErrors(prev => ({ ...prev, [id]: "" })))
         .catch((e: unknown) => {
@@ -52,7 +53,7 @@ export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder,
         setConfirmingId(id);
         setConfirmText(
           preview.affectedTasks > 0
-            ? `该标签正在被 ${preview.affectedTasks} 个任务使用。删除后，这些任务将移至「${fallbackName}」。`
+          ? `该标签正在被 ${preview.affectedTasks} 个任务使用。删除后，这些任务将变为未设置标签。`
             : "确认删除该标签？"
         );
       })
@@ -70,23 +71,28 @@ export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder,
     display: "flex", alignItems: "center", justifyContent: "center",
     opacity: disabled ? 0.5 : 1,
   } as const);
+  const visibleTags = search.trim()
+    ? searchEntities(tags, search, tag => [tag.name], tag => tag.id)
+    : tags;
 
   return (
     <div role="dialog" aria-modal="true" aria-label="管理标签"
       onClick={onClose}
       style={{
-        position: "fixed", inset: 0, zIndex: 85,
-        background: "rgba(2,3,5,0.45)",
-        display: "flex", alignItems: "center", justifyContent: "center",
+        position: embedded ? "relative" : "fixed", inset: embedded ? undefined : 0,
+        zIndex: embedded ? 1 : 85,
+        background: embedded ? "transparent" : "rgba(2,3,5,0.45)",
+        display: "flex", flex: embedded ? 1 : undefined,
+        alignItems: embedded ? "stretch" : "center", justifyContent: "center",
       }}>
       <div role="document" onClick={e => e.stopPropagation()}
         style={{
-          width: "min(420px, 90vw)", maxHeight: "80vh", overflowY: "auto",
+          width: embedded ? "100%" : "min(420px, 90vw)", maxHeight: embedded ? "100%" : "80vh", overflowY: "auto",
           padding: "18px 20px", borderRadius: 14,
           background: "rgba(8, 13, 18, 0.85)",
           backdropFilter: "blur(24px) saturate(1.05)", WebkitBackdropFilter: "blur(24px) saturate(1.05)",
           border: "1px solid rgba(215,228,230,0.14)",
-          boxShadow: "0 18px 48px rgba(2,3,5,0.5)",
+          boxShadow: embedded ? "none" : "0 18px 48px rgba(2,3,5,0.5)",
           display: "flex", flexDirection: "column", gap: 12,
         }}>
         <div style={{ display: "flex", alignItems: "center" }}>
@@ -100,8 +106,13 @@ export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder,
         </div>
         <HorizonDivider />
 
+        <input value={search} onChange={event => setSearch(event.target.value)}
+          placeholder="搜索标签…" aria-label="搜索标签"
+          className="input-ocean" style={{ fontFamily: "var(--font-sans)", fontSize: 11, color: C.textPrimary,
+            background: C.cardDim, border: `1px solid ${C.hairline}`, borderRadius: 7, padding: "6px 9px", cursor: "text" }} />
+
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          {tags.map(tag => {
+          {visibleTags.map(tag => {
             const isRenaming = renamingId === tag.id;
             const isConfirming = confirmingId === tag.id;
             return (
@@ -178,6 +189,11 @@ export function TagManager({ open, tags, onClose, onCreate, onRename, onReorder,
               </div>
             );
           })}
+          {search.trim() && visibleTags.length === 0 && (
+            <div style={{ padding: "12px 6px", color: C.textMuted, fontFamily: "var(--font-sans)", fontSize: 11 }}>
+              没有匹配的标签
+            </div>
+          )}
         </div>
 
         <HorizonDivider />

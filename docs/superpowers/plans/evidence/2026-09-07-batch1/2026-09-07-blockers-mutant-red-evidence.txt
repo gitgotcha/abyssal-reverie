@@ -1,0 +1,12 @@
+failures:
+failures:
+    db::tests::child_link_conservation_catches_a_swapped_task_id_in_budget_history
+    db::tests::child_link_conservation_catches_a_swapped_task_id_in_focus_segments
+    db::tests::child_link_conservation_catches_a_swapped_task_id_in_sessions
+    repository::tests::relationship_patch_clear_null_tag_keeps_revision
+    repository::tests::relationship_patch_keep_keep_keeps_revision
+    repository::tests::relationship_patch_set_same_tag_keeps_revision
+    repository::tests::statistics_by_tag_excludes_tagless_from_other
+    repository::tests::title_only_focus_round_keeps_null_tag_on_manual_finish
+    repository::tests::title_only_focus_round_keeps_null_tag_on_natural_completion
+test result: FAILED. 134 passed; 9 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.67s

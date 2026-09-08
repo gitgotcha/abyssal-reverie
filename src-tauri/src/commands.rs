@@ -198,6 +198,10 @@ pub fn preview_migration(state: State<'_, AppState>) -> Result<crate::models::Mi
 
 /// Applies the migration with the user's confirmed parameters, then returns
 /// the full bootstrap payload so the UI can continue without a restart.
+/// Versioned dispatch (task 1.4): a v4 database needs NO user decisions —
+/// the nullableMetadata upgrade is pure structure, so the confirmed params
+/// are validated-but-ignored there; v1–v3 keep the legacy semantic path
+/// (budget basis + 通用 mapping) exactly as before.
 #[tauri::command]
 pub fn confirm_migration(
     state: State<'_, AppState>,
@@ -209,14 +213,11 @@ pub fn confirm_migration(
     {
         return Err(CommandError::validation("no migration is pending"));
     }
-    if params.budget_focus_minutes < 1 || params.budget_focus_minutes > 180 {
-        return Err(CommandError::validation("budget_focus_minutes must be 1..=180"));
-    }
-    if params.general_mapping != "standalone" && params.general_mapping != "project" {
-        return Err(CommandError::validation("general_mapping must be standalone|project"));
-    }
     let mut conn = lock_db(&state)?;
-    crate::db::run_migrations_with(&mut conn, &params)?;
+    // Versioned dispatch lives in db::run_confirmed_migration: the version is
+    // checked first, and only the legacySemantic (v1–v3) path validates the
+    // confirmed params — a v4 upgrade ignores them entirely.
+    crate::db::run_confirmed_migration(&mut conn, &params)?;
     crate::db::seed_defaults(&conn)?;
     state
         .migration_pending

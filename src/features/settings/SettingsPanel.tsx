@@ -5,6 +5,7 @@ import { C, CARD } from "../shared/palette";
 import { DurationStepper } from "./DurationStepper";
 import { useAppGateway } from "../../services/gatewayContext";
 import { chineseDate } from "../shared/format";
+import { APP_VERSION } from "../../domain/buildInfo";
 
 export function SettingsPanel({ settings, onSaveSettings, onDataChanged }: {
   settings: AppSettings | null;
@@ -164,7 +165,7 @@ export function SettingsPanel({ settings, onSaveSettings, onDataChanged }: {
         position:"absolute", top:3, left: value ? 16 : 3,
         width:11, height:11, borderRadius:"50%",
         background: value ? C.silver : "rgba(215,228,230,0.18)",
-        transition:"all 0.24s cubic-bezier(0.22,1,0.36,1)",
+        transition:"background-color 0.24s, color 0.24s, border-color 0.24s, box-shadow 0.24s, transform 0.24s, opacity 0.24s",
       }} />
     </button>
   );
@@ -269,7 +270,7 @@ export function SettingsPanel({ settings, onSaveSettings, onDataChanged }: {
         <div style={{ ...CARD, borderRadius:12, padding:"11px 13px", marginBottom:20 }}>
           <div style={{ fontSize:9, color:"rgba(165,182,188,0.34)", marginBottom:4, fontFamily:"var(--font-sans)", letterSpacing:"0.10em", textTransform:"uppercase" }}>关于</div>
           <div style={{ fontSize:12, color:C.textSec, fontFamily:"var(--font-sans)" }}>深海专注 · 桌面计时器</div>
-          <div style={{ fontSize:10, color:C.textMuted, marginTop:2, fontFamily:"var(--font-mono)", letterSpacing:"0.04em" }}>v1.0.0 · 2026</div>
+          <div style={{ fontSize:10, color:C.textMuted, marginTop:2, fontFamily:"var(--font-mono)", letterSpacing:"0.04em" }}>v{APP_VERSION} · 2026</div>
         </div>
       </div>
       {importPreview && (

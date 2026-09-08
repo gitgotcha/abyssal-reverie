@@ -63,8 +63,7 @@ export function MigrationPrepScreen({ gateway, onMigrated }: {
         需要升级数据库
       </h1>
       <p style={{ fontSize: 12, lineHeight: 1.7, color: "rgba(220,232,236,0.75)", margin: 0 }}>
-        检测到旧版本的数据结构。升级会创建正式的项目与任务预算，并把历史专注记录
-        转为可追溯的时间账目。<strong>确认前不会修改任何数据</strong>；取消则退出应用，
+        检测到旧版本的数据结构。<strong>确认前不会修改任何数据</strong>；取消则退出应用，
         原数据保持不变。
       </p>
 
@@ -74,17 +73,17 @@ export function MigrationPrepScreen({ gateway, onMigrated }: {
         <>
           <div style={{ padding: "10px 12px", borderRadius: 10, background: "rgba(27,37,44,0.4)", border: "1px solid rgba(215,228,230,0.14)", fontSize: 12, lineHeight: 1.8, color: "#E7EFF0" }}>
             <div>任务：<strong>{preview.taskCount}</strong> 条 · 专注记录：<strong>{preview.sessionCount}</strong> 条</div>
-            <div>将创建正式项目：<strong>{preview.projectsToCreate.length}</strong> 个
+            {preview.migrationKind === "legacySemantic" ? <div>将创建正式项目：<strong>{preview.projectsToCreate.length}</strong> 个
               {preview.projectsToCreate.length > 0 && (
                 <span style={{ color: "rgba(220,232,236,0.6)" }}>
                   （{preview.projectsToCreate.slice(0, 8).join("、")}
                   {preview.projectsToCreate.length > 8 ? " …" : ""}）
                 </span>
               )}
-            </div>
+            </div> : <div>本次只允许任务的标签和优先级保持“未设置”，不会改写旧任务、预算或历史记录。</div>}
           </div>
 
-          <label style={fieldRow}>
+          {preview.migrationKind === "legacySemantic" && <><label style={fieldRow}>
             预算基准（每个番茄的分钟数，旧任务预算按此推算，来源会标注为“迁移估算”）
             <input type="number" min={1} max={180} value={budget}
               onChange={e => setBudget(Number(e.target.value) || 1)}
@@ -105,7 +104,7 @@ export function MigrationPrepScreen({ gateway, onMigrated }: {
                 创建正式项目「通用」
               </label>
             </div>
-          </div>
+          </div></>}
         </>
       )}
 

@@ -72,4 +72,16 @@ describe('Abyssal Reverie', () => {
     expect(archived).toBeDefined()
     expect(archived?.status).toBe('archived')
   })
+
+  it('shows the migration preparation screen when bootstrap requires an upgrade', async () => {
+    const gateway = new FakeAppGateway()
+    gateway.bootstrap = async () => {
+      throw { code: 'MIGRATION_REQUIRED', message: '需要升级数据库' }
+    }
+    renderWithGateway(gateway)
+
+    expect(await screen.findByText('需要升级数据库')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认升级' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '取消并退出' })).toBeInTheDocument()
+  })
 })

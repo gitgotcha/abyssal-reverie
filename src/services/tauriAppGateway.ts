@@ -44,6 +44,7 @@ import type {
   TimerSnapshot,
   UpdateTagInput,
   UpdateTaskInput,
+  RelationshipPatch,
 } from '../domain/models'
 import type { TrayAction, TrayIndicator, TimerExpiredPayload } from '../domain/tray'
 
@@ -59,6 +60,9 @@ export class TauriAppGateway implements AppGateway {
   finishTimer(input: FinishTimerInput) { return invoke<FinishTimerResult>('finish_timer', { input }) }
   createTask(input: CreateTaskInput) { return invoke<Task>('create_task', { input }) }
   updateTask(input: UpdateTaskInput) { return invoke<Task>('update_task', { input }) }
+  applyTaskRelationship(patch: RelationshipPatch) {
+    return invoke<Task>('apply_task_relationship', { patch })
+  }
   deleteTask(id: string) { return invoke<void>('delete_task', { id }) }
 
   // ─── Categories, projects & task ledger (v1.2) ────────────────────────────

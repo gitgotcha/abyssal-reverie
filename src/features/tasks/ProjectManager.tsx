@@ -1,13 +1,15 @@
 import { useState } from "react";
 import type { Category, Project } from "../../domain/models";
 import { C, CARD } from "../shared/palette";
+import { searchEntities } from "../../domain/search";
 
 /** v1.2 F6: project & category management — create projects under a category,
  *  rename, move between categories, archive; categories support create,
  *  rename and archive (deletion requires moving its projects first, which the
  *  archive-first model avoids entirely). */
-export function ProjectManager({ open, categories, projects, onClose, createProject, renameProject, archiveProject, createCategory, renameCategory, archiveCategory, moveProject }: {
+export function ProjectManager({ open, embedded = false, categories, projects, onClose, createProject, renameProject, archiveProject, createCategory, renameCategory, archiveCategory, moveProject }: {
   open: boolean;
+  embedded?: boolean;
   categories: Category[];
   projects: Project[];
   onClose: () => void;
@@ -22,6 +24,7 @@ export function ProjectManager({ open, categories, projects, onClose, createProj
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectCategory, setNewProjectCategory] = useState("");
   const [newCategoryName, setNewCategoryName] = useState("");
+  const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -47,27 +50,37 @@ export function ProjectManager({ open, categories, projects, onClose, createProj
   } as const;
 
   const activeCategories = categories.filter(c => c.status === "active");
+  const visibleProjects = search.trim()
+    ? searchEntities(projects, search, project => [project.name, project.description], project => project.id)
+    : projects;
 
   return (
     <div role="dialog" aria-modal="true" aria-label="管理项目与类别" onClick={onClose}
       style={{
-        position: "fixed", inset: 0, zIndex: 85, background: "rgba(2,3,5,0.45)",
-        display: "flex", alignItems: "center", justifyContent: "center",
+        position: embedded ? "relative" : "fixed", inset: embedded ? undefined : 0,
+        zIndex: embedded ? 1 : 85, background: embedded ? "transparent" : "rgba(2,3,5,0.45)",
+        display: "flex", flex: embedded ? 1 : undefined,
+        alignItems: embedded ? "stretch" : "center", justifyContent: "center",
       }}>
       <div role="document" onClick={e => e.stopPropagation()}
         style={{
-          width: "min(480px, 94vw)", maxHeight: "86vh", overflowY: "auto",
+          width: embedded ? "100%" : "min(480px, 94vw)", maxHeight: embedded ? "100%" : "86vh", overflowY: "auto",
           padding: "18px 20px", borderRadius: 14,
           background: "rgba(8, 13, 18, 0.88)",
           backdropFilter: "blur(22px) saturate(1.05)", WebkitBackdropFilter: "blur(22px) saturate(1.05)",
           border: "1px solid rgba(215,228,230,0.14)",
-          boxShadow: "0 18px 48px rgba(2,3,5,0.5)",
+          boxShadow: embedded ? "none" : "0 18px 48px rgba(2,3,5,0.5)",
           display: "flex", flexDirection: "column", gap: 12,
         }}>
         <div style={{ fontSize: 13, fontWeight: 500, color: C.textPrimary, fontFamily: "var(--font-sans)" }}>项目与类别</div>
 
-        {activeCategories.map(cat => {
-          const catProjects = projects.filter(p => p.categoryId === cat.id);
+        <input value={search} onChange={event => setSearch(event.target.value)}
+          placeholder="搜索项目…" aria-label="搜索项目"
+          className="input-ocean" style={{ fontFamily: "var(--font-sans)", fontSize: 11, color: C.textPrimary,
+            background: C.cardDim, border: `1px solid ${C.hairline}`, borderRadius: 7, padding: "6px 9px", cursor: "text" }} />
+
+        {activeCategories.filter(cat => !search.trim() || visibleProjects.some(project => project.categoryId === cat.id)).map(cat => {
+          const catProjects = visibleProjects.filter(p => p.categoryId === cat.id);
           return (
             <div key={cat.id} style={{ padding: "10px 12px", ...CARD }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -112,6 +125,12 @@ export function ProjectManager({ open, categories, projects, onClose, createProj
             </div>
           );
         })}
+
+        {search.trim() && visibleProjects.length === 0 && (
+          <div style={{ padding: "12px 4px", color: C.textMuted, fontFamily: "var(--font-sans)", fontSize: 11 }}>
+            没有匹配的项目
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
           <input value={newProjectName} onChange={e => setNewProjectName(e.target.value)}

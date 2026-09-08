@@ -559,6 +559,33 @@ fn run_v5_migration(tx: &Transaction<'_>) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// Versioned confirm dispatch (task 1.4, Codex 复审缺口 1): the database
+/// version is checked BEFORE any parameter validation. A v4 database takes
+/// the nullableMetadata path where the confirmed params are irrelevant —
+/// garbage params must still upgrade cleanly. Only v1–v3 (legacySemantic)
+/// validate and honour the budget basis / 通用 mapping decisions.
+pub fn run_confirmed_migration(
+    conn: &mut Connection,
+    params: &crate::models::MigrationParams,
+) -> Result<(), CommandError> {
+    let current = schema_version(conn)?;
+    if current >= 4 {
+        // nullableMetadata: pure structural upgrade — existing values are
+        // preserved verbatim and no user decision is consumed.
+        run_migrations(conn)?;
+        return Ok(());
+    }
+    // legacySemantic (v1–v3): the user's confirmed decisions drive the
+    // semantic step — validate them here, not before the version dispatch.
+    if params.budget_focus_minutes < 1 || params.budget_focus_minutes > 180 {
+        return Err(CommandError::validation("budget_focus_minutes must be 1..=180"));
+    }
+    if params.general_mapping != "standalone" && params.general_mapping != "project" {
+        return Err(CommandError::validation("general_mapping must be standalone|project"));
+    }
+    run_migrations_with(conn, params)
+}
+
 /// Opens a migrated, seeded in-memory database. Used by tests.
 pub fn open_in_memory() -> Result<Connection, CommandError> {
     let mut conn = Connection::open_in_memory()?;
@@ -1172,6 +1199,22 @@ pub fn preview_v4_migration(conn: &Connection) -> Result<crate::models::Migratio
     }
     let task_count: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?;
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    if version == 4 {
+        let suggested_focus_minutes: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT focus_duration_minutes FROM settings WHERE id = 1), 25)",
+            [],
+            |r| r.get(0),
+        )?;
+        return Ok(MigrationPreview {
+            migration_kind: "nullableMetadata".to_owned(),
+            schema_version: version,
+            task_count,
+            session_count,
+            projects_to_create: Vec::new(),
+            general_task_count: 0,
+            suggested_focus_minutes,
+        });
+    }
     let general_task_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tasks WHERE TRIM(project) = '通用'", [], |r| r.get(0))?
     ;
@@ -1187,6 +1230,7 @@ pub fn preview_v4_migration(conn: &Connection) -> Result<crate::models::Migratio
         |r| r.get(0),
     )?;
     Ok(MigrationPreview {
+        migration_kind: "legacySemantic".to_owned(),
         schema_version: version,
         task_count,
         session_count,
@@ -2022,6 +2066,586 @@ mod tests {
 
     // ─── 批次 1：v4 → v5（可空元数据；rename-first 重建 + 守恒对账）────────────
 
+    // ─── 阶段 A（任务 1.4 + 1.5）：版本化迁移预览与双起点协议 ──────────────────
+    // 行为组：v4 起点预览 = nullableMetadata（不展示旧项目映射、不重算预算）；
+    // v1–v3 起点 = legacySemantic（预算基准 + 通用映射决策）；确认前零改动；
+    // 取消零改动；确认后一次到 v5；失败整笔回滚；重复打开不重复迁移。
+
+    /// Builds a genuine v3 on-disk database (V1+V2 batches + run_v3_migration)
+    /// with one representative task in a legacy free-text project.
+    fn build_v3_database(db_path: &Path) {
+        let mut conn = Connection::open(db_path).expect("open");
+        conn.execute_batch(MIGRATION_V1).expect("apply v1");
+        conn.execute_batch(MIGRATION_V2).expect("apply v2");
+        conn.pragma_update(None, "user_version", 2u32).expect("v2 marker");
+        {
+            let tx = conn.transaction().expect("tx");
+            run_v3_migration(&tx).expect("v3 step");
+            tx.pragma_update(None, "user_version", 3u32).expect("v3 marker");
+            tx.commit().expect("commit v3");
+        }
+        seed_defaults(&conn).expect("seed settings/timer");
+        let fallback: String = conn
+            .query_row("SELECT id FROM tags WHERE is_fallback = 1", [], |r| r.get(0))
+            .expect("fallback tag");
+        conn.execute(
+            "INSERT INTO tasks (id, title, done, pomodoro_target, priority, project, tag_id,
+                                sort_order, created_at, updated_at, completed_at)
+             VALUES ('t-v3', '三版任务', 0, 2, 'med', 'Java 面试', ?1, 0, 1, 1, NULL)",
+            params![fallback],
+        )
+        .expect("task");
+    }
+
+    #[test]
+    fn v4_preview_reports_nullable_metadata_kind() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a1-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        let conn = open_prepared(&db_path).expect("prepared open must not migrate");
+        assert_eq!(schema_version(&conn).unwrap(), 4);
+        let preview = preview_v4_migration(&conn).expect("preview");
+        assert_eq!(preview.migration_kind, "nullableMetadata");
+        assert!(
+            preview.projects_to_create.is_empty(),
+            "v4 preview must NOT display legacy project mapping: {:?}",
+            preview.projects_to_create
+        );
+        assert_eq!(preview.task_count, 3);
+        assert_eq!(preview.session_count, 2);
+        // Preview is read-only: still v4 after previewing.
+        assert_eq!(schema_version(&conn).unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_preview_reports_legacy_semantic_kind() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v3_database(&db_path);
+
+        let conn = open_prepared(&db_path).expect("prepared open must not migrate");
+        assert_eq!(schema_version(&conn).unwrap(), 3);
+        let preview = preview_v4_migration(&conn).expect("preview");
+        assert_eq!(preview.migration_kind, "legacySemantic");
+        assert!(
+            preview.projects_to_create.contains(&"Java 面试".to_owned()),
+            "legacy preview must surface the consolidated projects: {:?}",
+            preview.projects_to_create
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_leaves_version_and_data_untouched_on_both_starts() {
+        // v4 起点：预览后取消（丢弃连接 = cancel_upgrade 的零改动语义）。
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a3-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+        {
+            let conn = open_prepared(&db_path).expect("prepared");
+            let _ = preview_v4_migration(&conn).expect("preview");
+        }
+        {
+            let raw = Connection::open(&db_path).expect("reopen");
+            assert_eq!(
+                raw.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0)).unwrap(),
+                4,
+                "cancel must not change the schema version"
+            );
+            assert_eq!(count(&raw, "tasks"), 3, "cancel must not touch data");
+            assert_eq!(count(&raw, "sessions"), 2);
+        }
+
+        // v3 起点：同样零改动。
+        let v3_path = dir.join("v3.sqlite");
+        build_v3_database(&v3_path);
+        {
+            let conn = open_prepared(&v3_path).expect("prepared");
+            let _ = preview_v4_migration(&conn).expect("preview");
+        }
+        {
+            let raw = Connection::open(&v3_path).expect("reopen");
+            assert_eq!(
+                raw.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0)).unwrap(),
+                3,
+                "cancel must not change the v3 schema version"
+            );
+            assert_eq!(count(&raw, "tasks"), 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v4_confirm_via_auto_path_reaches_v5_once_and_reopen_is_stable() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a4-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        // confirm（v4 路径 = 无用户参数的自动迁移，等价 confirm_migration 分派）。
+        let conn = open_at(&db_path).expect("confirm-equivalent upgrade");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(count(&conn, "tasks"), 3);
+        assert_eq!(count(&conn, "budget_history"), 3, "no duplicate migration rows");
+
+        // 重复打开：不二次迁移、不重复写。
+        drop(conn);
+        let second = open_at(&db_path).expect("reopen");
+        assert_eq!(schema_version(&second).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(count(&second, "tasks"), 3);
+        assert_eq!(count(&second, "budget_history"), 3, "reopen must not re-run migration");
+        assert_eq!(count(&second, "sessions"), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 阶段 A 修正（Codex 复审 4 缺口中的 1+2）：confirm 分派与双起点矩阵补齐 ──
+
+    #[test]
+    fn v4_confirm_ignores_irrelevant_legacy_params() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a6-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        // 缺口 1：v4 收到语义路径才会校验的垃圾参数——必须照样升级成功。
+        let garbage = crate::models::MigrationParams {
+            budget_focus_minutes: 999,
+            general_mapping: "not-a-choice".to_owned(),
+        };
+        let mut conn = Connection::open(&db_path).expect("open");
+        configure(&conn, false).expect("configure");
+        run_confirmed_migration(&mut conn, &garbage).expect("v4 confirm ignores legacy params");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(count(&conn, "tasks"), 3, "existing tasks preserved verbatim");
+        assert_eq!(count(&conn, "budget_history"), 3, "no budget recompute happened");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_confirm_rejects_invalid_params_before_any_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a7-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v3_database(&db_path);
+
+        let invalid = crate::models::MigrationParams {
+            budget_focus_minutes: 999,
+            general_mapping: "not-a-choice".to_owned(),
+        };
+        let mut conn = Connection::open(&db_path).expect("open");
+        configure(&conn, false).expect("configure");
+        let err = run_confirmed_migration(&mut conn, &invalid)
+            .expect_err("legacySemantic path must validate params");
+        assert!(
+            err.message.contains("budget_focus_minutes"),
+            "validation error must name the offending param: {err:?}"
+        );
+        // 零改动。
+        assert_eq!(schema_version(&conn).unwrap(), 3);
+        assert_eq!(count(&conn, "tasks"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_confirm_with_valid_params_reaches_v5_and_reopen_is_stable() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a8-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v3_database(&db_path);
+
+        let confirmed = crate::models::MigrationParams {
+            budget_focus_minutes: 30,
+            general_mapping: "project".to_owned(),
+        };
+        let mut conn = Connection::open(&db_path).expect("open");
+        configure(&conn, false).expect("configure");
+        run_confirmed_migration(&mut conn, &confirmed).expect("legacy confirm");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        // 用户裁定生效：'Java 面试' 按 project 映射成为真实项目，预算按 30 分钟。
+        let projects: i64 = count(&conn, "projects");
+        assert!(projects >= 1, "project mapping must create the real project");
+        let budget: i64 = conn
+            .query_row("SELECT target_seconds FROM tasks WHERE id = 't-v3'", [], |r| r.get(0))
+            .expect("budget");
+        assert_eq!(budget, 2 * 30 * 60, "confirmed basis minutes drive the estimate");
+        let budget_rows: i64 = count(&conn, "budget_history");
+        assert_eq!(budget_rows, 1, "exactly one migration budget row");
+
+        // 缺口 2：确认后重开不重复迁移。
+        drop(conn);
+        let second = open_at(&db_path).expect("reopen");
+        assert_eq!(schema_version(&second).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(count(&second, "budget_history"), 1, "reopen must not duplicate rows");
+        assert_eq!(count(&second, "projects"), projects);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_migration_failure_rolls_back_and_preserves_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a9-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v3_database(&db_path);
+
+        // 失败源：raw + FK OFF 注入悬挂 task_id 的 session——v3 形态合法，
+        // v4 迁移把历史专注转为 focus_segments（task_id REFERENCES tasks）时拒绝。
+        {
+            let raw = Connection::open(&db_path).expect("reopen fixture");
+            raw.pragma_update(None, "foreign_keys", "OFF").expect("fk off");
+            raw.execute(
+                "INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                                       tag_name_snapshot, mode, status, planned_seconds,
+                                       focused_seconds, started_at, ended_at, finish_reason,
+                                       statistics_eligible, qualification_reason)
+                 VALUES ('s-dangling', 't-missing', '坏引用', 'Java 面试', NULL, '', 'focus',
+                         'completed', 1500, 600, 10, 20, 'elapsed', 1, 'qualified')",
+                [],
+            )
+            .expect("dangling reference seeded");
+        }
+
+        let confirmed = crate::models::MigrationParams {
+            budget_focus_minutes: 25,
+            general_mapping: "standalone".to_owned(),
+        };
+        let mut conn = Connection::open(&db_path).expect("open");
+        configure(&conn, false).expect("configure");
+        let result = run_confirmed_migration(&mut conn, &confirmed);
+        assert!(result.is_err(), "dangling reference must abort the semantic migration");
+
+        // 整笔回滚：原文件零改动。
+        drop(conn);
+        let raw = Connection::open(&db_path).expect("reopen after failure");
+        assert_eq!(
+            raw.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0)).unwrap(),
+            3,
+            "failed migration must leave the source at v3"
+        );
+        assert_eq!(count(&raw, "tasks"), 1);
+        assert_eq!(count(&raw, "sessions"), 1, "source rows preserved verbatim");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v5_migration_failure_rolls_back_and_preserves_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-a5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+
+        // 注入失败源：raw open 显式 FK OFF 后写入一条悬挂 task_id 的 session——
+        // v4 形态上存在，v5 复制时事务内 FK ON 会拒绝 → 整笔回滚。
+        {
+            let raw = Connection::open(&db_path).expect("reopen fixture");
+            raw.pragma_update(None, "foreign_keys", "OFF")
+                .expect("disable FK on the throwaway connection");
+            raw.execute(
+                "INSERT INTO sessions (id, task_id, task_title_snapshot, project_snapshot, tag_id,
+                                       tag_name_snapshot, mode, status, planned_seconds,
+                                       focused_seconds, started_at, ended_at, finish_reason,
+                                       statistics_eligible, qualification_reason, profile_id)
+                 VALUES ('s-bad', 't-dangling', '坏引用', '通用', NULL, '', 'focus', 'completed',
+                         1500, 600, 10, 20, 'elapsed', 1, 'qualified', 'local')",
+                [],
+            )
+            .expect("dangling reference seeded (FK off on raw connection)");
+        }
+
+        let err = open_at(&db_path).expect_err("migration must fail on the dangling reference");
+        assert!(
+            err.message.contains("schema migration failed"),
+            "startup must abort with a diagnosable migration error: {err:?}"
+        );
+
+        // 整笔回滚：原文件零改动（版本、行数、坏行原样保留）。
+        let raw = Connection::open(&db_path).expect("reopen after failure");
+        assert_eq!(
+            raw.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0)).unwrap(),
+            4,
+            "failed migration must leave the source at v4"
+        );
+        assert_eq!(count(&raw, "tasks"), 3);
+        assert_eq!(count(&raw, "sessions"), 3, "source rows preserved verbatim");
+        assert_eq!(count(&raw, "budget_history"), 3);
+        assert_eq!(count(&raw, "focus_segments"), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 阶段 B（任务 1.8 + 1.10）：未来版本拒写 + 迁移副本演练 ────────────────
+
+    #[test]
+    fn v6_database_is_rejected_before_any_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-b1-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        {
+            let conn = open_at(&db_path).expect("fresh v5 database");
+            assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        }
+        // Simulate a FUTURE app having written the file: v6, journal flushed.
+        {
+            let raw = Connection::open(&db_path).expect("reopen");
+            raw.pragma_update(None, "journal_mode", "DELETE").expect("flush wal");
+            raw.pragma_update(None, "user_version", 6u32).expect("v6 marker");
+        }
+        let bytes_before = std::fs::read(&db_path).expect("read source bytes");
+
+        let err = open_at(&db_path).expect_err("a v6 file must be refused");
+        assert_eq!(err.code, crate::error::ErrorCode::DatabaseTooNew);
+
+        // Zero-write guarantee: the Phase-0 probe refuses BEFORE touching the
+        // source, so the file must be byte-identical.
+        let bytes_after = std::fs::read(&db_path).expect("read source bytes again");
+        assert_eq!(bytes_after, bytes_before, "v6 refusal must not modify the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drill_v4_fixture_full_protocol() {
+        // 任务 1.10：v4 副本上的完整迁移协议演练（预览 → 取消 → 确认 → 对账 →
+        // 重开 → 复预览拒绝）。真实库零触碰，全部操作在临时副本上。
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-b2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("abyssal-reverie.sqlite");
+        build_v4_database(&db_path);
+        // 副本再复制一份留底，演练后对账用。
+        let backup_path = dir.join("pre-migration-copy.sqlite");
+        std::fs::copy(&db_path, &backup_path).expect("keep a pre-state copy");
+
+        // 1) PREVIEW：open_prepared 零迁移，预览报 nullableMetadata。
+        {
+            let prep = open_prepared(&db_path).expect("prepared");
+            let preview = preview_v4_migration(&prep).expect("preview");
+            assert_eq!(preview.migration_kind, "nullableMetadata");
+            assert_eq!(schema_version(&prep).unwrap(), 4, "preview is read-only");
+        }
+
+        // 2) CANCEL：丢弃连接，副本仍 v4。
+        {
+            let raw = Connection::open(&db_path).expect("reopen after cancel");
+            assert_eq!(
+                raw.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0)).unwrap(),
+                4
+            );
+        }
+
+        // 3) CONFIRM：v4 路径忽略用户参数，一次到 v5。
+        let garbage = crate::models::MigrationParams {
+            budget_focus_minutes: 999,
+            general_mapping: "not-a-choice".to_owned(),
+        };
+        let mut conn = Connection::open(&db_path).expect("reopen for confirm");
+        configure(&conn, false).expect("configure");
+        run_confirmed_migration(&mut conn, &garbage).expect("confirm");
+        seed_defaults(&conn).expect("seed");
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+
+        // 4) 数据对账（与留底副本逐表对比）。
+        let pre = Connection::open(&backup_path).expect("pre-state copy");
+        for table in ["tasks", "sessions", "budget_history", "focus_segments"] {
+            let before: i64 = pre.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            let after: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(after, before, "{table} row count must be conserved");
+        }
+        let focused_before: i64 = pre
+            .query_row("SELECT COALESCE(SUM(focused_seconds), 0) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        let focused_after: i64 = conn
+            .query_row("SELECT COALESCE(SUM(focused_seconds), 0) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(focused_after, focused_before, "invested seconds conserved");
+
+        // 5) REOPEN：重开稳定；复预览被拒（无可迁移项）。
+        drop(conn);
+        let reopened = open_at(&db_path).expect("reopen");
+        assert_eq!(schema_version(&reopened).unwrap(), LATEST_SCHEMA_VERSION);
+        let preview_again = preview_v4_migration(&reopened);
+        assert!(
+            preview_again.is_err(),
+            "a v5 database has no pending migration to preview"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 任务 1.10 real-snapshot drill: upgrades a COPY of the user's real v4
+    /// database (gitignored rehearsal snapshot) through preview/cancel/
+    /// confirm/reconcile/reopen. The LIVE database is never touched. Restore
+    /// the snapshot first if it is missing — the drill stays reproducible and
+    /// never blocks the regular gates.
+    #[test]
+    #[ignore = "batch 1 drill: upgrades a COPY of the real v4 snapshot; run with cargo test drill_real_v4 -- --ignored --nocapture"]
+    fn drill_real_v4_to_v5_with_preview_and_reconcile() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../release/v1.3.0/rehearsal/live-v4")
+            .join("abyssal-reverie.sqlite");
+        assert!(
+            source.exists(),
+            "rehearsal v4 snapshot not found at {} — copy the live db (+ -wal + -shm) into release/v1.3.0/rehearsal/live-v4/ first",
+            source.display()
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "abyssal-drill-v5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        for ext in ["", "-wal", "-shm"] {
+            let from = std::path::PathBuf::from(format!("{}{ext}", source.display()));
+            if from.exists() {
+                std::fs::copy(&from, dir.join(format!("abyssal-reverie.sqlite{ext}")))
+                    .expect("copy must succeed");
+            }
+        }
+        let copy_path = dir.join("abyssal-reverie.sqlite");
+        // Preserve the complete pre-state, including SQLite's WAL sidecars.
+        // Copying only the main file can make committed rows appear missing
+        // when the source has not checkpointed its WAL yet.
+        let pre_state_dir = dir.join("pre-state");
+        std::fs::create_dir_all(&pre_state_dir).expect("pre-state dir");
+        for ext in ["", "-wal", "-shm"] {
+            let from = std::path::PathBuf::from(format!("{}{ext}", copy_path.display()));
+            if from.exists() {
+                std::fs::copy(&from, pre_state_dir.join(format!("abyssal-reverie.sqlite{ext}")))
+                    .expect("keep pre-state sidecar copy");
+            }
+        }
+        let pre_copy = pre_state_dir.join("abyssal-reverie.sqlite");
+
+        // 0) Pre-state: must be v4.
+        {
+            let pre = Connection::open(&copy_path).expect("pre-open");
+            let v = schema_version(&pre).expect("version");
+            eprintln!("[drill] source schema_version = {v}");
+            assert_eq!(v, 4, "the rehearsal snapshot must be schema v4");
+        }
+
+        // 1) PREVIEW (cancel path): read-only, still v4.
+        {
+            let prep = open_prepared(&copy_path).expect("prep open");
+            let preview = preview_v4_migration(&prep).expect("preview");
+            eprintln!(
+                "[drill] preview kind={} tasks={} sessions={}",
+                preview.migration_kind, preview.task_count, preview.session_count
+            );
+            assert_eq!(preview.migration_kind, "nullableMetadata");
+            assert_eq!(schema_version(&prep).unwrap(), 4, "preview is read-only");
+        }
+
+        // 2) CONFIRM: v4 path ignores params; one shot to v5.
+        let garbage = crate::models::MigrationParams {
+            budget_focus_minutes: 999,
+            general_mapping: "not-a-choice".to_owned(),
+        };
+        {
+            let mut conn = open_prepared(&copy_path).expect("reopen for migration");
+            run_confirmed_migration(&mut conn, &garbage).expect("confirmed migration");
+            seed_defaults(&conn).expect("seed");
+            assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+
+            // 3) Reconciliation against the pre-migration copy.
+            let pre = Connection::open(&pre_copy).expect("pre copy");
+            for table in ["tasks", "sessions", "budget_history", "focus_segments"] {
+                let before: i64 = pre
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                let after: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(after, before, "{table} rows must survive verbatim");
+                eprintln!("[drill] {table}: {before} -> {after} OK");
+            }
+        }
+
+        // 4) REOPEN: stable, no re-migration.
+        let reopened = open_at(&copy_path).expect("reopen");
+        assert_eq!(schema_version(&reopened).unwrap(), LATEST_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn v5_migration_conserves_exact_task_links_per_child_row() {

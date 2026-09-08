@@ -1,0 +1,222 @@
+warning: function `clean_project` is never used
+  --> src\repository.rs:81:4
+   |
+81 | fn clean_project(raw: &str) -> String {
+   |    ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src\db.rs:1768:17
+     |
+1768 |             let mut conn = Connection::open(&db_path).expect("open");
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src\db.rs:1816:17
+     |
+1816 |             let mut conn = Connection::open(&db_path).expect("open");
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\db.rs:1873:17
+     |
+1873 |             let mut conn = Connection::open(&db_path).expect("open");
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\db.rs:1914:13
+     |
+1914 |         let mut conn = Connection::open(db_path).expect("open");
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\db.rs:2548:17
+     |
+2548 |             let mut prep = open_prepared(&copy_path).expect("prep open");
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `result`
+    --> src\repository.rs:4789:13
+     |
+4789 |         let result = complete_timer(
+     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_result`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `abyssal-reverie` (lib) generated 1 warning
+warning: `abyssal-reverie` (lib test) generated 7 warnings (1 duplicate) (run `cargo fix --lib -p abyssal-reverie --tests` to apply 6 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.56s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\abyssal_reverie_lib-bb225ef64252af6d.exe)
+
+running 145 tests
+test db::tests::drill_real_v2_database_upgrade_to_v3 ... ignored, A4 drill: upgrades a COPY of the real v1.0.0 database; run with cargo test drill_real -- --ignored --nocapture
+test db::tests::drill_real_v3_to_v4_with_preview_and_reconcile ... ignored, v1.3.0 drill: upgrades a COPY of the real v1.1.1 snapshot; run with cargo test drill_real_v3 -- --ignored --nocapture
+test db::tests::child_link_conservation_catches_a_swapped_task_id_in_budget_history ... ok
+test db::tests::child_link_conservation_catches_a_swapped_task_id_in_focus_segments ... ok
+test db::tests::child_link_conservation_catches_a_swapped_task_id_in_sessions ... ok
+test db::tests::open_failure_is_not_treated_as_corruption ... ok
+test db::tests::migration_preview_reads_v3_without_converting ... ok
+test db::tests::newer_database_is_refused_and_untouched ... ok
+test db::tests::migrations_create_every_expected_table ... ok
+test db::tests::migrations_are_idempotent ... ok
+test db::tests::migration_failure_preserves_database_and_blocks_startup ... ok
+test db::tests::confirmed_migration_honours_user_parameters ... ok
+test db::tests::seed_defaults_inserts_a_single_settings_and_timer_row ... ok
+test db::tests::seed_defaults_is_idempotent ... ok
+test db::tests::deleting_a_task_preserves_its_session_with_a_null_task_id ... ok
+test db::tests::sessions_v3_rejects_invalid_qualification_fields ... ok
+test db::tests::single_row_tables_reject_a_second_row ... ok
+test error::tests::exposes_every_contract_code ... ok
+test error::tests::serializes_to_the_frontend_error_contract ... ok
+test models::tests::default_settings_match_the_frontend_defaults ... ok
+test models::tests::enums_round_trip_through_their_text_representation ... ok
+test models::tests::enums_serialize_to_the_frontend_strings ... ok
+test models::tests::task_deserializes_from_the_frontend_payload ... ok
+test models::tests::timer_snapshot_uses_camel_case_keys ... ok
+test db::tests::timer_state_rejects_a_negative_revision ... ok
+test db::tests::timer_state_rejects_a_non_positive_duration ... ok
+test db::tests::timer_state_rejects_negative_remaining_seconds ... ok
+test db::tests::migrates_v2_to_v3_with_default_tags_and_backfill ... ok
+test db::tests::empty_database_is_created_and_seeded_on_first_open ... ok
+test db::tests::corrupt_database_is_recovered_by_reseeding ... ok
+test db::tests::migrates_v4_to_v5_preserving_all_metadata ... ok
+test repository::tests::blank_and_oversized_titles_are_rejected ... ok
+test db::tests::pre_migration_backup_is_created_before_upgrading ... ok
+test repository::tests::all_time_statistics_only_count_completed_focus_sessions ... ok
+test db::tests::v3_database_migrates_to_v4_with_projects_budgets_and_segments ... ok
+test db::tests::v1_database_migrates_to_v2_preserving_data ... ok
+test repository::tests::blank_project_falls_back_to_the_default ... ok
+test repository::tests::complete_timer_is_idempotent ... ok
+test repository::tests::break_rounds_keep_fallback_tag_snapshot ... ok
+test repository::tests::complete_timer_rejects_abandoned_session_id ... ok
+test repository::tests::complete_task_now_saves_segment_and_unbinds_clock ... ok
+test repository::tests::category_and_project_crud_respect_uniqueness_and_completion_rules ... ok
+test repository::tests::complete_task_rejects_when_task_is_not_current ... ok
+test repository::tests::complete_timer_rejects_mismatched_session_id ... ok
+test repository::tests::complete_timer_before_deadline_is_rejected ... ok
+test repository::tests::complete_then_finish_race_yields_single_session ... ok
+test db::tests::v5_migration_conserves_rows_and_invested_time ... ok
+test repository::tests::complete_timer_creates_completed_session_and_done_timer ... ok
+test db::tests::v5_migration_handles_an_empty_database ... ok
+test repository::tests::complete_timer_within_scheduling_tolerance_is_allowed ... ok
+test db::tests::v3_migration_is_idempotent_on_reopen ... ok
+test db::tests::v5_migration_timer_binding_survives_verbatim ... ok
+test db::tests::v5_migration_conserves_exact_task_links_per_child_row ... ok
+test repository::tests::delete_removes_the_task ... ok
+test repository::tests::delete_tag_reassigns_tasks_and_preserves_snapshots ... ok
+test repository::tests::explicit_other_tag_round_persists_system_other ... ok
+test repository::tests::empty_project_id_detaches_to_standalone ... ok
+test repository::tests::explicit_tag_is_respected_on_create ... ok
+test repository::tests::export_backup_and_csv_preserve_hidden_sessions ... ok
+test repository::tests::export_sessions_csv_escapes_special_characters ... ok
+test repository::tests::enforces_hard_limit_of_100_tags ... ok
+test repository::tests::created_tasks_freeze_a_budget_snapshot ... ok
+test repository::tests::created_tasks_round_trip_through_the_database ... ok
+test repository::tests::creates_a_custom_tag_and_lists_it_last ... ok
+test repository::tests::delete_fallback_tag_is_rejected ... ok
+test repository::tests::get_statistics_buckets_sessions_into_explicit_day_boundaries ... ok
+test repository::tests::get_statistics_computes_by_project_aggregation ... ok
+test repository::tests::get_statistics_computes_streak_from_consecutive_days ... ok
+test repository::tests::get_statistics_rejects_boundary_outside_total_range ... ok
+test repository::tests::get_statistics_finds_best_day ... ok
+test repository::tests::get_statistics_rejects_overlapping_day_boundaries ... ok
+test repository::tests::export_then_import_round_trips_all_data ... ok
+test repository::tests::get_statistics_rejects_unordered_dates ... ok
+test repository::tests::exports_v2_bundle_with_tags ... ok
+test repository::tests::finish_at_30s_is_counted_and_visible ... ok
+test repository::tests::import_rejects_a_bad_backup_and_leaves_existing_data_intact ... ok
+test repository::tests::finish_from_paused_uses_persisted_remaining ... ok
+test repository::tests::finish_then_complete_race_yields_single_session ... ok
+test repository::tests::finish_timer_replay_with_stale_revision_returns_existing ... ok
+test repository::tests::finish_under_30s_is_hidden_and_not_counted ... ok
+test repository::tests::get_statistics_aggregates_by_tag_snapshot ... ok
+test repository::tests::pause_resume_round_trip_preserves_remaining ... ok
+test repository::tests::persist_running_as_paused_is_a_noop_when_not_running ... ok
+test repository::tests::persist_running_as_paused_freezes_remaining_and_bumps_revision ... ok
+test repository::tests::rejects_unknown_backup_version ... ok
+test repository::tests::preview_delete_reports_affected_tasks ... ok
+test repository::tests::preview_from_bundle_counts_tags ... ok
+test repository::tests::import_resets_a_running_timer_to_idle ... ok
+test repository::tests::quit_as_paused_is_resumable_on_next_launch ... ok
+test repository::tests::import_rejects_a_non_abyssal_backup ... ok
+test repository::tests::list_sessions_query_hides_ineligible_by_default ... ok
+test repository::tests::recalc_budget_records_history_and_keeps_invested_time ... ok
+test repository::tests::list_sessions_query_filters_by_time_range_and_limit ... ok
+test repository::tests::rejects_blank_overlong_or_control_char_tag_names ... ok
+test repository::tests::migrates_seeded_tags_are_listed_in_order ... ok
+test repository::tests::parses_v1_backup_json_via_header_and_backfills ... ok
+test repository::tests::out_of_range_pomodoro_targets_are_rejected ... ok
+test repository::tests::pause_rejects_non_running ... ok
+test repository::tests::relationship_patch_set_validates_entities ... ok
+test repository::tests::relationship_patch_stale_revision_rejected_even_if_equivalent ... ok
+test repository::tests::relationship_revision_ignores_plain_task_edits ... ok
+test repository::tests::renames_a_tag_and_rejects_conflicts ... ok
+test repository::tests::reset_from_idle_does_not_create_session ... ok
+test repository::tests::reorders_tag_by_swapping_with_neighbour ... ok
+test repository::tests::reset_from_running_writes_abandoned_and_returns_idle ... ok
+test repository::tests::save_settings_persists_and_returns_the_updated_row ... ok
+test repository::tests::rejects_duplicate_tag_names_case_insensitively ... ok
+test repository::tests::relationship_patch_clear_null_tag_keeps_revision ... ok
+test repository::tests::relationship_patch_keep_keep_keeps_revision ... ok
+test repository::tests::relationship_patch_clears_tag_and_project ... ok
+test repository::tests::relationship_patch_mixed_change_bumps_once ... ok
+test repository::tests::relationship_patch_rejects_stale_revision ... ok
+test repository::tests::relationship_patch_set_same_tag_keeps_revision ... ok
+test repository::tests::statistics_by_tag_excludes_tagless_from_other ... ok
+test repository::tests::statistics_treat_the_range_as_half_open ... ok
+test repository::tests::save_settings_refreshes_idle_timer_durations ... ok
+test repository::tests::switch_rejects_stale_revision_and_wrong_active_session ... ok
+test repository::tests::switch_mode_rejects_active_timer ... ok
+test repository::tests::switch_splits_effective_time_between_tasks ... ok
+test repository::tests::start_rejects_already_running ... ok
+test repository::tests::switch_timer_keeps_clock_and_splits_segments ... ok
+test repository::tests::save_settings_rejects_out_of_range_durations_and_goals ... ok
+test repository::tests::switch_to_a_missing_task_rolls_back_everything ... ok
+test repository::tests::switch_to_the_current_task_is_a_no_op ... ok
+test repository::tests::start_short_break_uses_break_snapshot ... ok
+test repository::tests::start_rejects_wrong_revision ... ok
+test repository::tests::start_timer_creates_a_running_session_with_task_snapshot ... ok
+test repository::tests::start_timer_freezes_task_tag ... ok
+test repository::tests::start_timer_without_task_uses_fixed_snapshot ... ok
+test repository::tests::title_only_task_gets_no_fallback_tag ... ok
+test repository::tests::title_only_task_persists_null_priority_in_db ... ok
+test repository::tests::title_only_task_persists_null_tag_in_db ... ok
+test repository::tests::toggling_done_sets_and_clears_completed_at ... ok
+test repository::tests::update_applies_only_the_supplied_fields ... ok
+test repository::tests::updating_title_preserves_tag_and_priority ... ok
+test repository::tests::switch_while_paused_starts_the_new_round_paused ... ok
+test repository::tests::updating_or_deleting_a_missing_task_is_not_found ... ok
+test repository::tests::tasks_are_returned_in_sort_order ... ok
+test repository::tests::switching_to_tagless_task_keeps_null_tag ... ok
+test repository::tests::tasks_table_allows_null_tag_id ... ok
+test repository::tests::tasks_table_allows_null_priority ... ok
+test repository::tests::ticker_settles_expired_without_frontend_and_is_single_shot ... ok
+test repository::tests::title_only_focus_round_keeps_null_tag_on_natural_completion ... ok
+test repository::tests::title_only_focus_round_keeps_null_tag_on_manual_finish ... ok
+test repository::tests::v2_backup_round_trips_through_parse_and_import ... ok
+
+test result: ok. 143 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.53s
+
+     Running unittests src\main.rs (src-tauri\target\debug\deps\abyssal_reverie-1b29962d63344d00.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests abyssal_reverie_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type {
-  AppSettings, Category, CompleteTaskInput, CreateTaskInput, ImportPreview, Project, Statistics,
+  AppSettings, Category, CompleteTaskInput, CreateTaskInput, ImportPreview, Project, RelationshipPatch, Statistics,
   Tag, Task, TaskPriority, TaskProgress, TimerMode, TimerSession, TimerSnapshot, UpdateTaskInput,
 } from "./domain/models";
 import { DEFAULT_SETTINGS, durationSecondsForMode } from "./domain/defaults";
@@ -14,7 +14,7 @@ import { MODE_LABELS, sessionToLog, sortLogsDesc, upsertLogNewestFirst, formatFo
 import { playCompletionSound, notifyCompletion } from "./features/shared/notify";
 import { GoalRing } from "./features/timer/GoalRing";
 import { TimerPanel } from "./features/timer/TimerPanel";
-import { TasksPanel } from "./features/tasks/TasksPanel";
+import { ManagementPanel } from "./features/management/ManagementPanel";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 import { StatsPanel, StatsPage } from "./features/stats/StatsPanel";
 import { MiniBar } from "./features/shared/MiniBar";
@@ -24,6 +24,8 @@ import { MigrationPrepScreen } from "./components/MigrationPrepScreen";
 
 const NAV_ITEMS: { id: NavSection; label: string; icon: React.JSX.Element }[] = [
   { id: "timer",    label: "专注",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6"/><path d="M12 7v5l3 3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
+  // Keep the established accessible name for keyboard users and existing
+  // shortcuts; the destination itself is now the unified 管理 workspace.
   { id: "tasks",    label: "任务",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
   { id: "stats",    label: "统计",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M5 20V10M12 20V4M19 20v-7" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
   { id: "settings", label: "设置",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.6"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg> },
@@ -608,6 +610,13 @@ export default function App() {
     return updated;
   }, [gateway, refreshTaskData]);
 
+  const applyTaskRelationship = useCallback(async (patch: RelationshipPatch) => {
+    const updated = await gateway.applyTaskRelationship(patch);
+    setTasks(p => p.map(t => (t.id === updated.id ? updated : t)));
+    refreshTaskData();
+    return updated;
+  }, [gateway, refreshTaskData]);
+
   // v1.2 D-7: archive instead of delete — history stays traceable.
   const archiveTask = useCallback(async (id: string, archived: boolean) => {
     const current = tasks.find(t => t.id === id);
@@ -627,6 +636,7 @@ export default function App() {
       activeSessionId: cur.activeSessionId,
     };
     const result = await gateway.completeTaskNow(input);
+    setTasks(p => p.map(task => task.id === result.task.id ? result.task : task));
     applyTimer(result.timer);
     refreshTaskData();
     if (result.newlyCompleted) {
@@ -646,7 +656,10 @@ export default function App() {
   const renameTagOp = useCallback(async (id: string, name: string) => {
     const tag = await gateway.updateTag({ id, name });
     setTags(p => p.map(t => (t.id === tag.id ? tag : t)));
-  }, [gateway]);
+    // Task rows carry a resolved project/tag display snapshot; reload them so
+    // a rename also invalidates the task search index immediately.
+    resync();
+  }, [gateway, resync]);
 
   const reorderTagOp = useCallback(async (id: string, direction: number) => {
     setTags(await gateway.reorderTag({ id, direction }));
@@ -674,10 +687,20 @@ export default function App() {
     const cycle: TaskPriority[] = ["low", "med", "high"];
     const current = tasks.find(t => t.id === id);
     if (!current) return;
-    const next = cycle[(cycle.indexOf(current.priority) + 1) % cycle.length];
-    const updated = await gateway.updateTask({ id, priority: next });
-    setTasks(p => p.map(t => (t.id === id ? updated : t)));
-  }, [gateway, tasks]);
+    // v5: null = 未设置 → first tap enters the cycle at its start (low).
+    const next: TaskPriority = current.priority
+      ? cycle[(cycle.indexOf(current.priority) + 1) % cycle.length]
+      : cycle[0];
+    await applyTaskRelationship({
+      taskId: id,
+      expectedRevision: current.relationshipRevision,
+      project: { action: "keep" },
+      tag: { action: "keep" },
+      priority: { action: "set", value: next },
+      deadline: { action: "keep" },
+      notes: { action: "keep" },
+    });
+  }, [applyTaskRelationship, tasks]);
 
   // The highlighted task follows the backend while a round exists; while
   // idle/done-waiting it is the user's pending selection (v1.1.2 B2).
@@ -704,12 +727,13 @@ export default function App() {
         />
       );
       case "tasks":    return (
-        <TasksPanel
+        <ManagementPanel
           tasks={tasks}
           tags={tags}
           categories={categories}
           projects={projects}
           progress={progress}
+          focusDurationMinutes={activeSettings.focusDurationMinutes}
           onCreateTask={createTask}
           onToggleTask={toggleTask}
           onArchiveTask={archiveTask}
@@ -717,6 +741,7 @@ export default function App() {
           onCompleteTask={completeTaskOp}
           onCyclePriority={cyclePriority}
           onUpdateTask={updateTaskOp}
+          onApplyTaskRelationship={applyTaskRelationship}
           onNotify={setToast}
           tagOps={{
             createTag: createTagOp,
@@ -734,6 +759,7 @@ export default function App() {
             renameProject: async (id, name) => {
               const project = await gateway.updateProject({ id, name });
               refreshTaskData();
+              resync();
               return project;
             },
             archiveProject: async (id, archived) => {
@@ -768,6 +794,27 @@ export default function App() {
       case "settings": return <SettingsPanel settings={settings} onSaveSettings={saveSettings} onDataChanged={() => { resync(); refreshStats(); }} />;
     }
   })();
+
+  // R06: old databases stay in a read-only preparation screen until the user
+  // confirms the migration. Keep this branch after all hooks so the normal
+  // app state remains safe to resume once the migration completes.
+  if (migrationPending) {
+    return (
+      <MigrationPrepScreen
+        gateway={gateway}
+        onMigrated={payload => {
+          setTasks(payload.tasks);
+          setTags(payload.tags);
+          setLogs(sortLogsDesc(payload.sessions.map(sessionToLog)));
+          setSettings(payload.settings);
+          applyTimerForced(payload.timer);
+          setMigrationPending(false);
+          refreshTaskData();
+          refreshStats();
+        }}
+      />
+    );
+  }
 
   const showRight = nav === "timer" || nav === "tasks";
 

@@ -40,6 +40,7 @@ import type {
   TimerSnapshot,
   UpdateTagInput,
   UpdateTaskInput,
+  RelationshipPatch, TaskPriority,
 } from '../domain/models'
 import type { TrayAction, TrayIndicator, TimerExpiredPayload } from '../domain/tray'
 
@@ -57,6 +58,8 @@ export interface AppGateway {
   finishTimer(input: FinishTimerInput): Promise<FinishTimerResult>
   createTask(input: CreateTaskInput): Promise<Task>
   updateTask(input: UpdateTaskInput): Promise<Task>
+  /** v1.4 阶段 C：原子关联变更（项目/标签/优先级 keep|clear|set + 修订号守卫）。 */
+  applyTaskRelationship(patch: RelationshipPatch): Promise<Task>
   deleteTask(id: string): Promise<void>
   // ─── Categories, projects & task ledger (v1.2) ────────────────────────────
   listCategories(): Promise<Category[]>
